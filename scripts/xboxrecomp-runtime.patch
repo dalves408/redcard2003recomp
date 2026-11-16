@@ -1,0 +1,3670 @@
+diff --git a/docs/runtime/environment-variables.md b/docs/runtime/environment-variables.md
+index 6c3596b..ccb19d2 100644
+--- a/docs/runtime/environment-variables.md
++++ b/docs/runtime/environment-variables.md
+@@ -88,6 +88,8 @@ The executor is itself opt-in: set `RECOMP_PB_EXEC=1` to execute the pushbuffer.
+ | `RECOMP_NV2A_TRACE` | off | Shows whether `DMA_PUT` moves at all. | `xbox_memory_layout.c` |
+ | `RECOMP_PB_REPORT_MS=N` | 10000 | Milliseconds between `[GPU]` reports (minimum 100). | `xbox_memory_layout.c` |
+ | `RECOMP_PB_EXEC_VERBOSE` | off | Per-batch trace. | `nv2a_pb_exec.c` |
++| `RECOMP_GVS_STATS` | off | Periodically print GPU-VS skip reasons (noprog/zorigin/probe/...). FFP batches no longer count as noprog when GPU-VS is on. | `nv2a_gvs_exec.inc` |
++| `RECOMP_GVS_FFP` | off | `1` runs fixed-function batches through GPU-VS (mul-fixed). Default stays CPU FFP until residual lattice meshes are clean. | `nv2a_gvs_exec.inc` |
+ | `RECOMP_PB_UNHANDLED_ALL` | top 10 | Lists every method the executor does not model, not only the top ten. | `nv2a_pb_exec.c` |
+ | `RECOMP_VBLANK[=paced]` | no vblanks | Raises vblanks: a ~50 Hz tick, or `paced` for the 60 Hz schedule. `0` or empty is off. | `kernel_bridge.c` |
+ | `RECOMP_FLIP_PACING[=edge]` | off | Holds each flip to the vblank count. | `nv2a_pb_exec.c` |
+@@ -111,7 +113,9 @@ The executor is itself opt-in: set `RECOMP_PB_EXEC=1` to execute the pushbuffer.
+ | `RECOMP_TEX_DUMP=<prefix>` | off | Writes each distinct texture as a BMP, first use only. | `nv2a_pb_exec.c` |
+ | `RECOMP_TEX_DUMP_EVERY=N` | 0 | Dumps every Nth texture bind instead. | `nv2a_pb_exec.c` |
+ | `RECOMP_FB_DUMP=<prefix>` | off | Writes the draw surface as a BMP at each report. | `nv2a_pb_exec.c`, `fb_present.c` |
+-| `RECOMP_FB_DUMP_FLIPS` | off | `1` dumps every flip; any other value names a file whose existence turns dumping on. | `nv2a_pb_exec.c` |
++| `RECOMP_FB_DUMP_FLIPS` | off | `1` dumps every published frame (flip and deferred no-flip scanout); any other value names a file whose existence turns dumping on. | `nv2a_pb_exec.c` |
++| `RECOMP_SCANOUT_IDLE_MS` | 3 | Host idle after `WAIT_FOR_IDLE` before a no-flip present (1..33). | `nv2a_pb_exec.c` |
++| `RECOMP_SCANOUT_FLIP_GATE_MS` | 100 | After `FLIP_STALL`, suppress no-flip presents for this many ms (0..500). Stops team-select / HUD mid-pass flashes; shorter than the old 500 ms gate so kickoff fades can still publish. | `nv2a_pb_exec.c` |
+ | `RECOMP_FIND_NAN` | off | Scans for NaN matrices at every report. | `nv2a_pb_exec.c` |
+ | `RECOMP_FIND_QUAD` | off | Scans once for quad vertices. | `nv2a_pb_exec.c` |
+ 
+@@ -129,7 +133,7 @@ The executor is itself opt-in: set `RECOMP_PB_EXEC=1` to execute the pushbuffer.
+ | `RECOMP_D3D_PRESENT` | off | Presents through a D3D11 swap chain. | `gpu_present.c` |
+ | `RECOMP_PRESENT_VSYNC` | on | `0` turns vsync off. | `gpu_present.c`, `fb_present_sdl.c` |
+ | `RECOMP_PRESENT_FILTER` | default | Sampler filter for the D3D11 present. | `gpu_present.c` |
+-| `RECOMP_FMV_HOST` | off | Plays a movie through the host player when the title asks to. A substitute for the title's own output. | `kernel_bridge.c` |
++| `RECOMP_FMV_HOST` | off | Plays a requested WMV or AVI through the host player instead of the title's own output. AVI playback uses FFmpeg, including MidiVid VQ (`MVDV`). | `kernel_bridge.c`, `video_player.c` |
+ | `RECOMP_FMV_DUMP=<prefix>` | off | Writes two frames of a movie as BMP evidence. | `video_pump.c` |
+ 
+ ## Audio
+@@ -147,6 +151,7 @@ See the [APU](../../src/apu/README.md) and [DirectSound](../../src/audio/README.
+ | `RECOMP_AUDIO_WAV_SECS=N` | unlimited | Caps the recording. | `apu_core.c` |
+ | `RECOMP_APU_HRTF` | on | `0` turns HRTF for 3D voices off. | `apu_vp.c` |
+ | `RECOMP_APU_MIXDOWN_ALL` | on | `0` limits the mixdown. | `apu_dsp.c` |
++| `RECOMP_APU_MIXDOWN_GAIN` | 1.0 | Linear gain after the bin sum, before soft-clip. | `apu_dsp.c` |
+ | `RECOMP_APU_DSP_ACK` | auto | DSP doorbell acknowledgement: `auto` derives it, `0`/`off` disables, or a list of addresses. | `apu_dsp.c` |
+ | `RECOMP_AUDIO_BUF_COUNT`, `RECOMP_AUDIO_BUF_SAMPLES` | built-in | Device buffer count and size. | `apu_sdl2.c`, `apu_xaudio2.c` |
+ 
+diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
+index a6a3657..5d40176 100644
+--- a/src/apu/apu_core.c
++++ b/src/apu/apu_core.c
+@@ -1409,6 +1409,18 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
+     /* Start background frame thread */
+     qemu_thread_create(&d->apu_thread, "mcpx.apu_thread",
+                        mcpx_apu_frame_thread, d, QEMU_THREAD_JOINABLE);
++#ifdef _WIN32
++    /* The frame thread mostly sleeps in throttle(), but when it is due it
++     * must run: on a slow quad core (a low-power Pentium) the guest's busy threads
++     * held it off long enough to drain the device queue 13-250 times a
++     * session, each an audible crackle. One step above normal is enough to
++     * be scheduled ahead of them; RECOMP_AUDIO_PRIORITY=0 leaves it normal. */
++    {
++        const char *e = getenv("RECOMP_AUDIO_PRIORITY");
++        if (!(e && e[0] == '0'))
++            SetThreadPriority(d->apu_thread.thread, THREAD_PRIORITY_ABOVE_NORMAL);
++    }
++#endif
+     mcpx_apu_wait_for_idle(d);
+     qemu_mutex_unlock(&d->lock);
+ 
+diff --git a/src/apu/apu_dsp.c b/src/apu/apu_dsp.c
+index bd36f2a..2d597f4 100644
+--- a/src/apu/apu_dsp.c
++++ b/src/apu/apu_dsp.c
+@@ -23,8 +23,10 @@
+  */
+ 
+ #include "apu_state.h"
++#include "apu.h"
+ #include "fpconv.h"
+ 
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -114,6 +116,82 @@ static int mcpx_apu_mixdown_all(void)
+     return on;
+ }
+ 
++/* Fold bins 0-5 as 5.1 speakers (default on). RECOMP_APU_MIXDOWN=legacy
++ * keeps the plain even-left / odd-right sum for every bin. */
++static int mcpx_apu_mixdown_51(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("RECOMP_APU_MIXDOWN");
++        on = !(e && !strcmp(e, "legacy"));
++    }
++    return on;
++}
++
++/* Optional linear gain after the bin sum, before soft-clip.
++ * RECOMP_APU_MIXDOWN_GAIN=<float>, default 1.0. */
++static float mcpx_apu_mixdown_gain(void)
++{
++    static float g = -1.0f;
++    if (g < 0.0f) {
++        const char *e = getenv("RECOMP_APU_MIXDOWN_GAIN");
++        g = (e && *e) ? (float)atof(e) : 1.0f;
++        if (!(g > 0.0f) || g > 8.0f) g = 1.0f;
++    }
++    return g;
++}
++
++/* Soft-clip instead of a hard ±1 rail. Summing music + crowd + effects used
++ * to slam into the rail and square off speech and bright one-shots —
++ * announcer "terrible", ball-hit "screech" — while a quieter bed still looked
++ * fine on a WAV peak meter between hits. */
++static float mcpx_apu_soft_clip(float x)
++{
++    const float knee = 0.85f;
++    float ax = fabsf(x);
++    float y;
++    if (ax <= knee)
++        return x;
++    y = knee + (1.0f - knee) * tanhf((ax - knee) / (1.0f - knee));
++    if (y > 1.0f) y = 1.0f;
++    return copysignf(y, x);
++}
++
++/* RECOMP_APU_TRACE: once a second, per-bin peak and a clip counter so an
++ * in-match capture shows which mixbins carry crowd vs effects vs voice. */
++static void mcpx_apu_mixdown_trace(const float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
++                                  int clipped)
++{
++    static int on = -1;
++    static unsigned frames, secs;
++    static float peak[NUM_MIXBINS];
++    static unsigned clip_total;
++    int b;
++
++    if (on < 0)
++        on = apu_env_on("RECOMP_APU_TRACE");
++    if (!on) return;
++
++    for (b = 0; b < NUM_MIXBINS; b++) {
++        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
++            float a = fabsf(mixbins[b][i]);
++            if (a > peak[b]) peak[b] = a;
++        }
++    }
++    clip_total += (unsigned)clipped;
++    if (++frames % 1500)
++        return;
++    secs++;
++    fprintf(stderr, "[APU-BIN] t=%us clip=%u", secs, clip_total);
++    for (b = 0; b < NUM_MIXBINS; b++) {
++        if (peak[b] > 1e-4f)
++            fprintf(stderr, " b%02d=%.3f", b, peak[b]);
++        peak[b] = 0.0f;
++    }
++    fprintf(stderr, "\n");
++    clip_total = 0;
++}
++
+ /* GPRST (GP region + 0xFFFC): the GP runs only with both reset bits set, as
+  * in xemu's gp_write. Nothing else models the GP, so this is kept for the
+  * =auto ack alone. Before the first write the GP counts as running: a title
+@@ -277,8 +355,31 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
+              * pairing the guest set up -- bins 6/7 and 8/9 arrive with matched
+              * counts. This is not what a real EP does; it is the cheapest
+              * mixdown that stops discarding audio. */
+-            float left, right;
+-            if (mcpx_apu_mixdown_all()) {
++            float left, right, gain;
++            int clipped = 0;
++            if (mcpx_apu_mixdown_all() && mcpx_apu_mixdown_51()) {
++                /* Bins 0-5 are DirectSound's speakers: FL FR C LFE BL BR.
++                 * On a stereo console the GP folds them down; here, the
++                 * usual fold: centre at -3 dB into both sides, each rear at
++                 * -3 dB into its own side. The LFE bin is not low-passed
++                 * here (no bass management) and RedCard sends full-band
++                 * audio to it -- its stereo crowd/music voice puts the left
++                 * channel in C and the right in LFE -- so LFE folds like C,
++                 * which keeps that routing balanced (dropping it left the
++                 * match 2 dB left-heavy). The even/odd rule below put the
++                 * centre in the left speaker alone and the LFE in the right:
++                 * RedCard pans its mono effects by bin, so every centred
++                 * effect came out of one side. Bins 6 and up keep the
++                 * even/odd sum. */
++                const float k = 0.70710678f;
++                float c = k * (mixbins[2][i] + mixbins[3][i]);
++                left  = mixbins[0][i] + c + k * mixbins[4][i];
++                right = mixbins[1][i] + c + k * mixbins[5][i];
++                for (int b = 6; b < NUM_MIXBINS; ++b) {
++                    if (b & 1) right += mixbins[b][i];
++                    else       left  += mixbins[b][i];
++                }
++            } else if (mcpx_apu_mixdown_all()) {
+                 left = 0.0f;
+                 right = 0.0f;
+                 for (int b = 0; b < NUM_MIXBINS; ++b) {
+@@ -289,16 +390,21 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
+                 left = mixbins[0][i];
+                 right = mixbins[1][i];
+             }
+-            /* Clamp to [-1, 1] range */
+-            if (left > 1.0f) left = 1.0f;
+-            if (left < -1.0f) left = -1.0f;
+-            if (right > 1.0f) right = 1.0f;
+-            if (right < -1.0f) right = -1.0f;
++            gain = mcpx_apu_mixdown_gain();
++            left *= gain;
++            right *= gain;
++            if (fabsf(left) > 1.0f || fabsf(right) > 1.0f)
++                clipped = 1;
++            left = mcpx_apu_soft_clip(left);
++            right = mcpx_apu_soft_clip(right);
+ 
+             /* Convert to 16-bit and write (not accumulate) into frame buffer.
+              * Each of the 8 sub-frames writes its own 32-sample slice. */
+             d->monitor.frame_buf[off + i][0] = (int16_t)(left * 32767.0f);
+             d->monitor.frame_buf[off + i][1] = (int16_t)(right * 32767.0f);
++
++            if (i == 0)
++                mcpx_apu_mixdown_trace(mixbins, clipped);
+         }
+     }
+ 
+diff --git a/src/apu/apu_state.h b/src/apu/apu_state.h
+index eb33b70..cfdbc4c 100644
+--- a/src/apu/apu_state.h
++++ b/src/apu/apu_state.h
+@@ -380,9 +380,12 @@ typedef struct MCPXAPUVoiceFilter {
+     uint16_t voice;
+     float resample_buf[NUM_SAMPLES_PER_FRAME * 2];
+     SRC_STATE *resampler;
+-    /* Linear-interpolation resampler state (voice_resample): the two source
+-     * samples the output sits between, the output's position in [0,1)
+-     * between them, and whether they have been fetched yet. */
++    /* Windowed-sinc resampler state (voice_resample): the last 64 source
++     * frames, stored twice (at i and i + 64) so a window is always one
++     * contiguous run; rs_head is the oldest. The output sits rs_pos of the
++     * way from window sample 31 to 32. rs_have says the window is primed. */
++    float rs_ring[128][2];
++    int   rs_head;
+     float rs_last[2], rs_next[2], rs_pos;
+     int   rs_have;
+     sv_filter svf[2];
+diff --git a/src/apu/apu_voice_pages.inc b/src/apu/apu_voice_pages.inc
+new file mode 100644
+index 0000000..af031b5
+--- /dev/null
++++ b/src/apu/apu_voice_pages.inc
+@@ -0,0 +1,68 @@
++/* Voice sample pages keep the RAM/window meaning chosen on first use after
++ * VOICE_ON. Global DMA resolution still handles voice/SGE/notifier structures.
++ * Derived from NHL Hitz Pro's protection; retain every ambiguous page rather
++ * than a 16-slot cache which can evict a still-playing voice's decision.
++ * Same LGPL-2.1-or-later license as apu_vp.c. Caller holds the voice lock. */
++#define VP_PAGE_SHIFT 12u
++#define VP_PAGE_SIZE (1u << VP_PAGE_SHIFT)
++#define VP_AMBIGUOUS_BYTES (64u << 20)
++#define VP_CHOICE_BYTES (VP_AMBIGUOUS_BYTES / VP_PAGE_SIZE / 4)
++/* 2 bits/page: 0 unknown, 1 RAM, 2 contiguous window. 1 MiB for 256 voices. */
++static uint8_t s_vp_page_choice[MCPX_HW_MAX_VOICES][VP_CHOICE_BYTES];
++static void vp_pages_forget(uint32_t v)
++{
++    if(v<MCPX_HW_MAX_VOICES)memset(s_vp_page_choice[v],0,sizeof s_vp_page_choice[v]);
++}
++static uint8_t *vp_phys(uint32_t v,hwaddr addr)
++{
++    uint32_t a=(uint32_t)addr&0x0FFFFFFFu;
++    if(v>=MCPX_HW_MAX_VOICES||a>=VP_AMBIGUOUS_BYTES)return mcpx_apu_phys(addr);
++    uint32_t page=a>>VP_PAGE_SHIFT,shift=(page&3u)*2u;
++    uint8_t *slot=&s_vp_page_choice[v][page>>2];
++    unsigned choice=(*slot>>shift)&3u;
++    if(!choice){
++        uintptr_t ram=(uintptr_t)g_apu_ram_ptr+(a&~(VP_PAGE_SIZE-1u));
++        uint8_t *base=mcpx_apu_phys((hwaddr)(a&~(VP_PAGE_SIZE-1u)));
++        if((uintptr_t)base==ram)choice=1;
++        else if((uintptr_t)base==ram+0x80000000ull)choice=2;
++        else return mcpx_apu_phys(addr); /* Preserve any future resolver domain. */
++        *slot=(uint8_t)((*slot&~(3u<<shift))|(choice<<shift));
++    }
++    return (uint8_t *)((uintptr_t)g_apu_ram_ptr+a+(choice==2?0x80000000ull:0));
++}
++/* Swap a page's recorded RAM/window choice for voice v (used when ADPCM
++ * block headers prove the other copy is the real one). Returns 1 if it did. */
++static int vp_page_flip(uint32_t v,hwaddr addr)
++{
++    uint32_t a=(uint32_t)addr&0x0FFFFFFFu;
++    if(v>=MCPX_HW_MAX_VOICES||a>=VP_AMBIGUOUS_BYTES)return 0;
++    uint32_t page=a>>VP_PAGE_SHIFT,shift=(page&3u)*2u;
++    uint8_t *slot=&s_vp_page_choice[v][page>>2];
++    unsigned choice=(*slot>>shift)&3u;
++    if(choice!=1&&choice!=2)return 0;
++    *slot=(uint8_t)((*slot&~(3u<<shift))|((3u-choice)<<shift));
++    return 1;
++}
++static void vp_read(uint32_t v,hwaddr addr,void *output,size_t bytes)
++{
++    uint8_t *out=output;
++    while(bytes){
++        size_t n=VP_PAGE_SIZE-((uint32_t)addr&(VP_PAGE_SIZE-1u));if(n>bytes)n=bytes;
++        memcpy(out,vp_phys(v,addr),n);out+=n;addr+=n;bytes-=n;
++    }
++}
++static uint8_t vp_ldub(uint32_t v,hwaddr a){return *vp_phys(v,a);}
++static uint16_t vp_lduw(uint32_t v,hwaddr a)
++{
++    uint16_t x;
++    if(((uint32_t)a&(VP_PAGE_SIZE-1u))<=VP_PAGE_SIZE-sizeof x)memcpy(&x,vp_phys(v,a),sizeof x);
++    else vp_read(v,a,&x,sizeof x);
++    return x;
++}
++static uint32_t vp_ldl(uint32_t v,hwaddr a)
++{
++    uint32_t x;
++    if(((uint32_t)a&(VP_PAGE_SIZE-1u))<=VP_PAGE_SIZE-sizeof x)memcpy(&x,vp_phys(v,a),sizeof x);
++    else vp_read(v,a,&x,sizeof x);
++    return x;
++}
+diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
+index 94e57da..ebe44bc 100644
+--- a/src/apu/apu_vp.c
++++ b/src/apu/apu_vp.c
+@@ -22,6 +22,7 @@
+ #include "apu_state.h"
+ #include "apu.h"
+ #include "fpconv.h"
++#include "apu_voice_pages.inc"
+ 
+ /* #define DEBUG_MCPX */
+ 
+@@ -69,6 +70,7 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
+ 
+ static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
+ {
++    vp_pages_forget(v);
+     assert(v < MCPX_HW_MAX_VOICES);
+     memset(&d->vp.filters[v].svf, 0, sizeof(d->vp.filters[v].svf));
+     d->vp.filters[v].gain_valid = false;     /* a new voice starts at its level */
+@@ -130,6 +132,7 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
+ 
+ static void voice_off(MCPXAPUState *d, uint16_t v)
+ {
++    vp_pages_forget(v);
+     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
+ 
+@@ -758,8 +761,8 @@ struct VpVoiceStat {
+     double   sq;
+     float    last, ea, rate;
+     uint32_t addr, fmt;
+-    uint16_t vol0, vol1;
+-    uint8_t  bin0, bin1;
++    uint16_t vol0, vol1, vols[8];
++    uint8_t  bin0, bin1, bins[8];
+     const char *cls;
+ };
+ static struct VpVoiceStat s_vstat[MCPX_HW_MAX_VOICES];
+@@ -866,6 +869,10 @@ static void vp_stat_report(void)
+                 s->rate, s->ea, s->vol0, s->vol1, s->bin0, s->bin1, s->addr,
+                 s->cls ? s->cls : "?", s->frames,
+                 sqrt(s->sq / s->frames) * 32768.0, (double)s->zc / s->frames);
++        fprintf(stderr, "[APU-VBINS] t=%us v=%u", s_vstat_secs, v);
++        for (int i = 0; i < 8; i++)
++            if (s->vols[i] < 0xFFF) fprintf(stderr, " b%u:%03X", s->bins[i], s->vols[i]);
++        fprintf(stderr, "\n");
+         s->frames = 0; s->zc = 0; s->sq = 0;
+     }
+ }
+@@ -1075,6 +1082,58 @@ static void vp_ring_report(unsigned secs)
+  * Sample fetching from voice buffers
+  * ============================================================ */
+ 
++/* ADPCM blocks vouch for the memory they were read from.
++ *
++ * A sample page below 64 MB can name a heap (RAM) page or a contiguous
++ * window page with the same number; vp_phys picks one the first time a
++ * voice touches it. Picked wrong, an effect plays whatever the other copy
++ * holds -- crackle and noise on the short one-shot effects (ball, whistle,
++ * tackles) while long streams sound right. Every 36-byte block opens with a
++ * header per channel: a sample, a step index that must be 0..88, and a
++ * byte that encoders leave 0. When the copy in use fails that and the other
++ * copy passes it, the voice switches pages and stays switched. */
++static unsigned s_adpcm_flips, s_adpcm_flip_reverts;
++
++static int adpcm_headers_ok(const uint32_t *blk, unsigned int channels)
++{
++    const uint8_t *b = (const uint8_t *)blk;
++    for (unsigned int ch = 0; ch < channels; ch++)
++        if (b[4 * ch + 2] > 88 || b[4 * ch + 3] != 0)
++            return 0;
++    return 1;
++}
++
++static int adpcm_try_other_copy(uint32_t v, hwaddr a0, hwaddr a1)
++{
++    static unsigned bad;
++    if (++bad <= 30 || (bad & (bad - 1)) == 0)
++        fprintf(stderr, "[APU] voice %u: ADPCM header invalid at %08X (%s)"
++                " [%u bad headers so far]\n", v, (uint32_t)a0,
++                mcpx_apu_phys_class(a0), bad);
++    int n = vp_page_flip(v, a0);
++    if (((uint32_t)a1 >> VP_PAGE_SHIFT) != ((uint32_t)a0 >> VP_PAGE_SHIFT))
++        n |= vp_page_flip(v, a1);
++    return n;
++}
++
++static void adpcm_check_flip(uint32_t v, hwaddr a0, hwaddr a1,
++                             const uint32_t *blk, unsigned int channels,
++                             unsigned int block_index)
++{
++    if (adpcm_headers_ok(blk, channels)) {
++        s_adpcm_flips++;
++        if (s_adpcm_flips <= 20 || (s_adpcm_flips & (s_adpcm_flips - 1)) == 0)
++            fprintf(stderr, "[APU] voice %u block %u at %08X: header invalid in"
++                    " the copy in use, valid in the other; page switched"
++                    " (%u so far)\n", v, block_index, (uint32_t)a0, s_adpcm_flips);
++        return;
++    }
++    /* Neither copy looks like ADPCM here (or the title pads its blocks):
++     * put the choice back and play what was there, as before. */
++    adpcm_try_other_copy(v, a0, a1);
++    s_adpcm_flip_reverts++;
++}
++
+ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+                        int num_samples_requested)
+ {
+@@ -1211,17 +1270,37 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+                 uint32_t linear_addr = block_index * (uint32_t)block_size;
+                 if (stream) {
+                     hwaddr addr = segment_offset + linear_addr;
+-                    memcpy(adpcm_block, mcpx_apu_phys(addr),
+-                           block_size);
++                    vp_read(v, addr, adpcm_block, block_size);
++                    if (!adpcm_headers_ok(adpcm_block, channels)
++                            && adpcm_try_other_copy(v, addr, addr + block_size - 1)) {
++                        vp_read(v, addr, adpcm_block, block_size);
++                        adpcm_check_flip(v, addr, addr + block_size - 1,
++                                         adpcm_block, channels, block_index);
++                    }
+                 } else {
+-                    linear_addr += ba;
+-                    for (unsigned int word_index = 0;
+-                         word_index < (9 * samples_per_block); word_index++) {
+-                        hwaddr addr = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
+-                                                   0xFFFFFFFF, linear_addr);
+-                        adpcm_block[word_index] =
+-                            ldl_le_phys(address_space_memory, addr);
+-                        linear_addr += 4;
++                    uint32_t first_lin = linear_addr + ba;
++                    hwaddr a0 = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
++                                             0xFFFFFFFF, first_lin);
++                    hwaddr a1 = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
++                                             0xFFFFFFFF,
++                                             first_lin + (uint32_t)block_size - 4);
++                    for (int pass = 0; pass < 2; pass++) {
++                        linear_addr = first_lin;
++                        for (unsigned int word_index = 0;
++                             word_index < (9 * samples_per_block); word_index++) {
++                            hwaddr addr = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
++                                                       0xFFFFFFFF, linear_addr);
++                            adpcm_block[word_index] = vp_ldl(v, addr);
++                            linear_addr += 4;
++                        }
++                        if (pass == 1) {
++                            adpcm_check_flip(v, a0, a1, adpcm_block, channels,
++                                             block_index);
++                            break;
++                        }
++                        if (adpcm_headers_ok(adpcm_block, channels)
++                                || !adpcm_try_other_copy(v, a0, a1))
++                            break;
+                     }
+                 }
+                 adpcm_decode_block(adpcm_decoded, (uint8_t *)adpcm_block,
+@@ -1250,19 +1329,19 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+                 float fval;
+                 switch (sample_size) {
+                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_U8:
+-                    ival = ldub_phys(address_space_memory, addr);
++                    ival = vp_ldub(v, addr);
+                     fval = uint8_to_float((uint8_t)(ival & 0xff));
+                     break;
+                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16:
+-                    ival = lduw_le_phys(address_space_memory, addr);
++                    ival = vp_lduw(v, addr);
+                     fval = int16_to_float((int16_t)(ival & 0xffff));
+                     break;
+                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S24:
+-                    ival = ldl_le_phys(address_space_memory, addr);
++                    ival = vp_ldl(v, addr);
+                     fval = int24_to_float(ival);
+                     break;
+                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S32:
+-                    ival = ldl_le_phys(address_space_memory, addr);
++                    ival = vp_ldl(v, addr);
+                     fval = int32_to_float(ival);
+                     break;
+                 default:
+@@ -1315,15 +1394,170 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+ }
+ 
+ /* ============================================================
+- * Voice resampling (linear interpolation in place of libsamplerate)
++ * Voice resampling: band-limited (windowed-sinc) interpolation
+  *
+- * libsamplerate is stubbed; voice_resample below interpolates linearly
+- * between source frames at the pitch's ratio, keeping its position and
+- * the last frame across calls in the voice's filter state.
++ * RedCard's effects, speech and crowd are 11.025 and 22.05 kHz voices played
++ * at the 48 kHz frame rate. Linear interpolation between source frames (what
++ * this did before) leaves the spectral images of the source above its
++ * Nyquist frequency: measured in a match, -12 dB (11 kHz voices) to -20 dB
++ * (22 kHz) of energy where the source has none, heard as hiss and grit on
++ * every effect -- the "scratchy" sound. xemu uses libsamplerate's sinc
++ * converter. This is a Kaiser-windowed sinc, 8 zero crossings each side
++ * (16 taps when upsampling), cut off just below the lower of the two Nyquist
++ * frequencies; when a voice is pitched up (rate < 1) the kernel widens by
++ * 1/rate, up to the 64-frame window. RECOMP_APU_RESAMPLE=linear restores
++ * the old interpolator.
++ *
++ * The window looks 32 source frames ahead, so a voice starts 32 frames late
++ * (1.5 ms at 22 kHz) and its last 32 frames are not played.
+  * ============================================================ */
+ 
++#define RS_WIN    64            /* source frames held per voice */
++#define RS_CENTER 31            /* window index the output follows */
++#define RS_ZC     8             /* zero crossings each side of the kernel */
++#define RS_TABLE  512           /* kernel samples per zero crossing */
++#define RS_CUTOFF 0.94f         /* fraction of the lower Nyquist kept */
++static float s_rs_kernel[RS_ZC * RS_TABLE + 2];
++static int s_rs_linear = -1;
++
++static double rs_bessel_i0(double x)
++{
++    double sum = 1.0, term = 1.0, q = x * x / 4.0;
++    for (int k = 1; k < 40; k++) {
++        term *= q / ((double)k * k);
++        sum += term;
++        if (term < sum * 1e-12) break;
++    }
++    return sum;
++}
++
++static void voice_resample_init(void)
++{
++    const double beta = 8.0;
++    const double i0b = rs_bessel_i0(beta);
++    const char *e = getenv("RECOMP_APU_RESAMPLE");
++    s_rs_linear = e && !strcmp(e, "linear");
++    for (int i = 0; i <= RS_ZC * RS_TABLE + 1; i++) {
++        double x = (double)i / RS_TABLE;          /* in zero crossings */
++        double r = x / RS_ZC;
++        double sinc = x == 0.0 ? 1.0 : sin(3.14159265358979323846 * x) / (3.14159265358979323846 * x);
++        double win = r >= 1.0 ? 0.0 : rs_bessel_i0(beta * sqrt(1.0 - r * r)) / i0b;
++        s_rs_kernel[i] = (float)(sinc * win);
++    }
++    fprintf(stderr, "[APU] voice resampler: %s\n",
++            s_rs_linear ? "linear (RECOMP_APU_RESAMPLE=linear)"
++                        : "windowed sinc, 16 taps (RECOMP_APU_RESAMPLE=linear for the old one)");
++}
++
++/* Kernel at x zero crossings from its centre (any sign). */
++static inline float rs_kernel(float x)
++{
++    float t = fabsf(x) * RS_TABLE;
++    int i = (int)t;
++    if (i >= RS_ZC * RS_TABLE) return 0.0f;
++    float f = t - (float)i;
++    return s_rs_kernel[i] + f * (s_rs_kernel[i + 1] - s_rs_kernel[i]);
++}
++
++static inline void rs_push(MCPXAPUVoiceFilter *f, const float s[2])
++{
++    int h = f->rs_head;
++    f->rs_ring[h][0] = f->rs_ring[h + RS_WIN][0] = s[0];
++    f->rs_ring[h][1] = f->rs_ring[h + RS_WIN][1] = s[1];
++    f->rs_head = (h + 1) & (RS_WIN - 1);
++}
++
++static int voice_resample_linear(MCPXAPUState *d, uint16_t v, float samples[][2],
++                                 int requested_num, float rate);
++
+ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
+                           int requested_num, float rate)
++{
++    MCPXAPUVoiceFilter *f = &d->vp.filters[v];
++    float src[NUM_SAMPLES_PER_FRAME * 4 + 2][2];
++    const int max_src = (int)(sizeof(src) / sizeof(src[0]));
++    float step, c, reach;
++    int need, got, in, out;
++
++    if (s_rs_linear)
++        return voice_resample_linear(d, v, samples, requested_num, rate);
++    if (!(rate > 0.0f)) rate = 1.0f;
++    step = 1.0f / rate;
++
++    if (!f->rs_have) {
++        /* Prime: silence before the voice, then frames 0..32 of it, so the
++         * output starts on frame 0 with its 32 successors in the window. */
++        int want = RS_WIN - RS_CENTER;           /* 33 */
++        got = voice_get_samples(d, v, src, want);
++        if (got < want) return got < 0 ? got : 0;
++        memset(f->rs_ring, 0, sizeof f->rs_ring);
++        f->rs_head = 0;
++        for (in = 0; in < RS_CENTER; in++) {
++            static const float z[2] = { 0.0f, 0.0f };
++            rs_push(f, z);
++        }
++        for (in = 0; in < got; in++)
++            rs_push(f, src[in]);
++        f->rs_pos = 0.0f;
++        f->rs_have = 1;
++    }
++
++    /* As in the linear version: fetch exactly the source frames the
++     * requested outputs step past, never more. */
++    for (;;) {
++        need = (int)floorf(f->rs_pos + (float)(requested_num - 1) * step);
++        if (need <= max_src || requested_num <= 1) break;
++        requested_num /= 2;
++    }
++    if (need > max_src) need = max_src;
++    if (need < 0) need = 0;
++    got = need > 0 ? voice_get_samples(d, v, src, need) : 0;
++    if (got < 0) got = 0;
++
++    /* Kernel scale: 1 when upsampling (cut at the source's Nyquist), rate
++     * when pitched up (cut at the output's), both trimmed by RS_CUTOFF. */
++    c = (rate < 1.0f ? rate : 1.0f) * RS_CUTOFF;
++    reach = (float)RS_ZC / c;                    /* kernel half-width */
++    if (reach > (float)RS_CENTER) reach = (float)RS_CENTER;
++
++    for (in = 0, out = 0; out < requested_num; out++) {
++        while (f->rs_pos >= 1.0f) {
++            if (in >= got) goto done;
++            rs_push(f, src[in++]);
++            f->rs_pos -= 1.0f;
++        }
++        {
++            const float (*w)[2] = (const float (*)[2])f->rs_ring[f->rs_head];
++            int k0 = RS_CENTER - (int)reach, k1 = RS_CENTER + 1 + (int)reach;
++            float acc0 = 0.0f, acc1 = 0.0f, norm = 0.0f;
++            if (k0 < 0) k0 = 0;
++            if (k1 > RS_WIN - 1) k1 = RS_WIN - 1;
++            for (int k = k0; k <= k1; k++) {
++                float t = (float)(k - RS_CENTER) - f->rs_pos;   /* frames */
++                float h = rs_kernel(t * c);
++                acc0 += h * w[k][0];
++                acc1 += h * w[k][1];
++                norm += h;
++            }
++            /* Normalise to unity gain at DC: the truncated window's sum
++             * ripples slightly with the output's phase. */
++            if (norm > 1e-6f) { acc0 /= norm; acc1 /= norm; }
++            samples[out][0] = acc0;
++            samples[out][1] = acc1;
++        }
++        f->rs_pos += step;
++    }
++done:
++    if (out == 0 && got == 0) {
++        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
++                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
++        return active ? 0 : -1;
++    }
++    return out;
++}
++
++static int voice_resample_linear(MCPXAPUState *d, uint16_t v, float samples[][2],
++                                 int requested_num, float rate)
+ {
+     /* Linear interpolation in place of libsamplerate. `rate` is the output
+      * to source ratio the VP's pitch encodes (libsamplerate's src_ratio):
+@@ -1538,6 +1772,7 @@ static void voice_process(MCPXAPUState *d,
+         s_vstat[v].rate = rate;
+         s_vstat[v].vol0 = vol[0]; s_vstat[v].vol1 = vol[1];
+         s_vstat[v].bin0 = (uint8_t)bin[0]; s_vstat[v].bin1 = (uint8_t)bin[1];
++        for (int i = 0; i < 8; i++) { s_vstat[v].bins[i] = (uint8_t)bin[i]; s_vstat[v].vols[i] = vol[i]; }
+     }
+ 
+     if (voice_should_mute(v)) return;
+@@ -1587,11 +1822,23 @@ static void voice_process(MCPXAPUState *d,
+         }
+     }
+ 
+-    /* Mix into bins */
++    /* Mix into bins.
++     *
++     * On hardware the first four bins of a 3D voice are HRTF *taps* that the
++     * GP turns into stereo. Our GP is a passthrough stub, and MIXDOWN_ALL
++     * then sums every bin into L/R, so dumping the same voice into all four
++     * HRTF submixes double-counts every positional effect (ball hits, passes)
++     * and hard-clips them into a screech on top of the crowd. The VP's own
++     * hrtf_filter_process (when enabled) already produced stereo in
++     * samples[][], so under the stub only the first two HRTF submix bins —
++     * the stereo pair — are written. Bins 4..7 (FX sends) stay as the title
++     * programmed them. */
+     for (int b = 0; b < 8; b++) {
+         float g = ea_value;
+         float hr;
+         if ((v < MCPX_HW_MAX_3D_VOICES) && (b < 4)) {
++            if (b >= 2)
++                continue;
+             hr = (float)(1 << d->vp.hrtf_headroom);
+         } else {
+             hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
+@@ -1738,6 +1985,7 @@ void mcpx_apu_vp_init(MCPXAPUState *d)
+ {
+     /* Single-threaded - no worker dispatch needed */
+     (void)d;
++    voice_resample_init();
+ }
+ 
+ /* Shutdown, after the frame thread has stopped: close the voice dumps, free
+@@ -1745,6 +1993,7 @@ void mcpx_apu_vp_init(MCPXAPUState *d)
+  * switches again and starts from nothing. */
+ void mcpx_apu_vp_finalize(MCPXAPUState *d)
+ {
++    memset(s_vp_page_choice, 0, sizeof s_vp_page_choice);
+     (void)d;
+     if (s_vdump)
+         fclose(s_vdump);
+@@ -1768,6 +2017,7 @@ void mcpx_apu_vp_finalize(MCPXAPUState *d)
+ 
+ void mcpx_apu_vp_reset(MCPXAPUState *d)
+ {
++    memset(s_vp_page_choice, 0, sizeof s_vp_page_choice);
+     d->vp.ssl_base_page = 0;
+     d->vp.hrtf_headroom = 0;
+     memset(d->vp.ssl, 0, sizeof(d->vp.ssl));
+diff --git a/src/apu/apu_xaudio2.c b/src/apu/apu_xaudio2.c
+index e725646..c284ce6 100644
+--- a/src/apu/apu_xaudio2.c
++++ b/src/apu/apu_xaudio2.c
+@@ -25,11 +25,14 @@
+ 
+ #define XA2_SAMPLE_RATE   48000
+ #define XA2_CHANNELS      2
+-/* Device buffer size and count. Defaults 512 x 4 (10.7 ms each, 43 ms
+- * worst case queued); RECOMP_AUDIO_BUF_SAMPLES and RECOMP_AUDIO_BUF_COUNT
+- * override them at xa2_init, clamped to the static storage below. */
++/* Device buffer size and count. Defaults 512 x 8 (10.7 ms each, 85 ms
++ * worst case queued; pacing keeps 43-85 ms). Four buffers (21-43 ms) ran
++ * dry on a slow quad core whenever the frame thread was held off that
++ * long, each underrun a crackle. RECOMP_AUDIO_BUF_SAMPLES and
++ * RECOMP_AUDIO_BUF_COUNT override them at xa2_init, clamped to the static
++ * storage below. */
+ #define XA2_BUF_SAMPLES_DEFAULT 512
+-#define XA2_NUM_BUFS_DEFAULT    4
++#define XA2_NUM_BUFS_DEFAULT    8
+ #define XA2_BUF_SAMPLES_MIN     128
+ #define XA2_BUF_SAMPLES_MAX     4096
+ #define XA2_NUM_BUFS_MIN        2
+@@ -167,6 +170,13 @@ int xa2_is_active(void)
+     return g_xa2_initialized;
+ }
+ 
++/* RedCard overlay: silence output while the quit/settings menu is open. */
++void xa2_set_muted(int muted)
++{
++    if (g_xa2_master)
++        g_xa2_master->lpVtbl->SetVolume(g_xa2_master, muted ? 0.0f : 1.0f, 0);
++}
++
+ /* Hand mixed samples to XAudio2. Called from the APU frame thread with one
+  * EP period (256 samples) at a time. Samples accumulate in the current device
+  * buffer, which is submitted when full, so a call shorter than a buffer is
+diff --git a/src/input/keyboard.c b/src/input/keyboard.c
+index 99ffa12..2f9b3cc 100644
+--- a/src/input/keyboard.c
++++ b/src/input/keyboard.c
+@@ -20,6 +20,11 @@
+ #include "input_map.h"
+ #include <stdlib.h>
+ #include <string.h>
++#include <stdio.h>
++#ifdef _WIN32
++#include <windows.h>
++#endif
++#include "redcard_keymap.h"
+ 
+ /* Reading this needs no lock. Each entry is written only by the window's
+  * thread and read only by the game's poll, one byte at a time, and a press
+@@ -147,17 +152,59 @@ static int row_control(const xbox_key_row *r)
+     return -1;
+ }
+ 
++/* RedCard: player's remapped keys from %LOCALAPPDATA%\RedCard2003\keymap.ini. */
++static uint8_t s_ovr[REDCARD_KEYMAP_COUNT][2];
++static int     s_ovr_set[REDCARD_KEYMAP_COUNT];
++static int     s_ovr_loaded;
++
++static void keymap_load(void)
++{
++#ifdef _WIN32
++    static const char *const ids[REDCARD_KEYMAP_COUNT] = {
++#define X(id, label, k0, k1) #id,
++        REDCARD_KEYMAP(X)
++#undef X
++    };
++    char base[MAX_PATH], path[MAX_PATH], key[48];
++    int i;
++
++    if (!GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof base) || strlen(base) > MAX_PATH - 40)
++        return;
++    snprintf(path, sizeof path, "%s\\RedCard2003\\keymap.ini", base);
++    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES)
++        return;
++    for (i = 0; i < REDCARD_KEYMAP_COUNT && (size_t)i < xbox_key_map_count; i++) {
++        int k0, k1;
++        snprintf(key, sizeof key, "%s", ids[i]);
++        k0 = (int)GetPrivateProfileIntA("keys", key, -1, path);
++        snprintf(key, sizeof key, "%s_alt", ids[i]);
++        k1 = (int)GetPrivateProfileIntA("keys", key, -1, path);
++        if (k0 < 0 && k1 < 0)
++            continue;
++        s_ovr[i][0] = (uint8_t)(k0 >= 0 && k0 < 256 ? k0 : xbox_key_map[i].vk[0]);
++        s_ovr[i][1] = (uint8_t)(k1 >= 0 && k1 < 256 ? k1 : xbox_key_map[i].vk[1]);
++        s_ovr_set[i] = 1;
++    }
++#endif
++}
++
+ void xbox_InputKeyboardBindings(InputBindings *b)
+ {
++    if (!s_ovr_loaded) {
++        s_ovr_loaded = 1;
++        keymap_load();
++    }
+     memset(b, 0, sizeof *b);
+     /* Full deflection on a diagonal, as this map has always given. */
+     b->diagonal = INPUT_DIAGONAL_FULL;
+     for (size_t i = 0; i < xbox_key_map_count; i++) {
+         const xbox_key_row *r = &xbox_key_map[i];
+         int c = row_control(r);
+-        for (int k = 0; k < 2; k++)
+-            if (c >= 0 && r->vk[k] && b->count[c] < INPUT_BINDINGS_PER_CONTROL)
+-                b->key[c][b->count[c]++] = r->vk[k];
++        for (int k = 0; k < 2; k++) {
++            uint8_t vk = (i < REDCARD_KEYMAP_COUNT && s_ovr_set[i]) ? s_ovr[i][k] : r->vk[k];
++            if (c >= 0 && vk && b->count[c] < INPUT_BINDINGS_PER_CONTROL)
++                b->key[c][b->count[c]++] = vk;
++        }
+     }
+ }
+ 
+diff --git a/src/input/redcard_keymap.h b/src/input/redcard_keymap.h
+new file mode 100644
+index 0000000..3cfd753
+--- /dev/null
++++ b/src/input/redcard_keymap.h
+@@ -0,0 +1,36 @@
++/* The keyboard actions the player can remap, in the order of xbox_key_map[].
++ * Shared by the game (keyboard.c reads keymap.ini) and config.exe (writes it).
++ * X(id, label, default key, default alternate key); keys are Windows virtual-key codes,
++ * 0 = none. The ini is %LOCALAPPDATA%\RedCard2003\keymap.ini. */
++#ifndef REDCARD_KEYMAP_H
++#define REDCARD_KEYMAP_H
++
++#define REDCARD_KEYMAP(X) \
++    X(dpad_up,      "D-pad up",          0x26, 0)    \
++    X(dpad_down,    "D-pad down",        0x28, 0)    \
++    X(dpad_left,    "D-pad left",        0x25, 0)    \
++    X(dpad_right,   "D-pad right",       0x27, 0)    \
++    X(start,        "Start",             0x0D, 0)    \
++    X(back,         "Back",              0x08, 0)    \
++    X(lthumb,       "Left stick click",  0x10, 0)    \
++    X(rthumb,       "Right stick click", 0x11, 0)    \
++    X(a,            "A",                 'Z',  0)    \
++    X(b,            "B",                 'X',  0)    \
++    X(x,            "X",                 'C',  0)    \
++    X(y,            "Y",                 'V',  0)    \
++    X(white,        "White",             'Q',  0)    \
++    X(black,        "Black",             'E',  0)    \
++    X(ltrigger,     "Left trigger",      '1',  0)    \
++    X(rtrigger,     "Right trigger",     '3',  0)    \
++    X(lstick_up,    "Left stick up",     'W',  0x68) \
++    X(lstick_down,  "Left stick down",   'S',  0x62) \
++    X(lstick_left,  "Left stick left",   'A',  0x64) \
++    X(lstick_right, "Left stick right",  'D',  0x66) \
++    X(rstick_up,    "Right stick up",    'I',  0)    \
++    X(rstick_down,  "Right stick down",  'K',  0)    \
++    X(rstick_left,  "Right stick left",  'J',  0)    \
++    X(rstick_right, "Right stick right", 'L',  0)
++
++#define REDCARD_KEYMAP_COUNT 24
++
++#endif
+diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
+index 9476517..d60abd7 100644
+--- a/src/kernel/kernel_bridge.c
++++ b/src/kernel/kernel_bridge.c
+@@ -969,6 +969,9 @@ static void bridge_PsCreateSystemThreadEx(void)
+ static void bridge_note_async_handle(uint32_t token);
+ static void bridge_forget_async_handle(uint32_t token);
+ static int  bridge_handle_is_async(uint32_t token);
++static void bridge_signal_async_file(uint32_t token);
++static void bridge_reset_async_file(uint32_t token);
++static HANDLE bridge_resolve_wait_handle(uint32_t token);
+ 
+ /* Handle-table helpers; defined further below. Xbox memory slots are 32-bit
+  * but native HANDLEs are 64-bit pointers, so handles are kept in a table and
+@@ -2061,7 +2064,7 @@ static void bridge_KeWaitForSingleObject(void)
+ 
+     h = ke_shadow_lookup(object);
+     if (!h)
+-        h = bridge_resolve_handle(object);
++        h = bridge_resolve_wait_handle(object);
+     if (!h)
+         h = XBOX_TO_NATIVE(object);
+ 
+@@ -2079,7 +2082,11 @@ static void bridge_KeWaitForSingleObject(void)
+  */
+ static void bridge_NtWaitForSingleObject(void)
+ {
+-    HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
++    /* Async file tokens must wait on their I/O completion event, not the
++     * raw CreateFile handle (non-overlapped file handles are not waitable).
++     * RedCard profile create: WriteFile Data00 (async, Event=NULL, APC set)
++     * then NtWaitForSingleObject(file) → CREATING PROFILE… forever. */
++    HANDLE   handle      = bridge_resolve_wait_handle(STACK_ARG(0));
+     uint32_t alertable   = STACK_ARG(1);
+     uint32_t timeout_ptr = STACK_ARG(2);
+ 
+@@ -2134,7 +2141,7 @@ static HANDLE bridge_resolve_handle(uint32_t token);
+ 
+ static void bridge_NtWaitForSingleObjectEx(void)
+ {
+-    HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
++    HANDLE   handle      = bridge_resolve_wait_handle(STACK_ARG(0));
+     uint32_t wait_mode   = STACK_ARG(1);
+     uint32_t alertable   = STACK_ARG(2);
+     uint32_t timeout_ptr = STACK_ARG(3);
+@@ -2206,7 +2213,7 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
+         return;
+     }
+     for (i = 0; i < count; i++)
+-        handles[i] = bridge_resolve_handle(BRIDGE_MEM32(handles_va + i * 4));
++        handles[i] = bridge_resolve_wait_handle(BRIDGE_MEM32(handles_va + i * 4));
+ 
+     {
+         static int logged;
+@@ -3227,9 +3234,22 @@ static void kernel_vblank_raise(void)
+  * edge, 0 when vblanks are off. */
+ #define VBLANK_RESTART_NS 100000000ull
+ 
++/* RedCard settings: paced vblank rate (game frame limiter). RECOMP_VBLANK_HZ
++ * at start; xbox_set_vblank_hz() changes it while running. */
++static volatile unsigned s_vblank_hz = 60;
++static volatile int s_vblank_restart;
++
++void xbox_set_vblank_hz(unsigned hz)
++{
++    if (hz < 30) hz = 30;
++    if (hz > 1000) hz = 1000;
++    if (hz != s_vblank_hz) { s_vblank_hz = hz; s_vblank_restart = 1; }
++}
++
+ static uint64_t vblank_due(uint64_t t0_ns, uint64_t n)
+ {
+-    return t0_ns + n * 1000000000ull / 60u;
++    unsigned hz = s_vblank_hz ? s_vblank_hz : 60u;
++    return t0_ns + n * 1000000000ull / hz;
+ }
+ 
+ static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
+@@ -3242,9 +3262,16 @@ static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
+     if (kernel_vblank_mode() != XBOX_VBLANK_PACED)
+         return 0;
+     if (!started) {
++        const char *e = getenv("RECOMP_VBLANK_HZ");
+         started = 1;
+         t0_ns = now_ns;
+         count = 0;
++        if (e && atoi(e) > 0) xbox_set_vblank_hz((unsigned)atoi(e));
++    }
++    if (s_vblank_restart) {
++        s_vblank_restart = 0;
++        t0_ns = now_ns;
++        count = 0;
+     }
+     due = vblank_due(t0_ns, count);
+     if (now_ns < due) {
+@@ -4393,7 +4420,8 @@ static void bridge_NtCreateFile(void)
+             n++;
+         }
+         host[n] = 0;
+-        if (n > 4 && _stricmp(host + n - 4, ".wmv") == 0
++        if (n > 4 && (_stricmp(host + n - 4, ".wmv") == 0 ||
++                      _stricmp(host + n - 4, ".avi") == 0)
+                 && !xbox_VideoIsPlaying())
+             xbox_VideoPlayFile(host);
+     }
+@@ -4413,6 +4441,12 @@ static void bridge_NtOpenFile(void)
+     g_eax = (uint32_t)bridge_create_file_impl(
+         handle_va, access, obj_attrs, iostatus,
+         0, share, 1 /* FILE_OPEN */, options, 0);
++
++    /* Same async-handle bookkeeping as NtCreateFile: XCreateSaveGame opens
++     * the title UDATA directory with NtOpenFile (no SYNCHRONOUS bits) and
++     * then waits on NtQueryDirectoryFile completion against that handle. */
++    if (g_eax == 0 && handle_va && (options & 0x30u) == 0u)
++        bridge_note_async_handle(BRIDGE_MEM32(handle_va));
+ }
+ 
+ /*
+@@ -4479,15 +4513,25 @@ static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
+ 
+ /* Per-thread pending-APC ring. An APC is delivered on the thread that issued
+  * the request, which is also the thread that waits, so thread-local is right. */
+-static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
+-                                    uint32_t apc_context, uint32_t iostatus)
++static void bridge_complete_file_io(uint32_t file_token, uint32_t event_token,
++                                    uint32_t apc_routine, uint32_t apc_context,
++                                    uint32_t iostatus)
+ {
+     if (event_token) {
+         HANDLE ev = bridge_resolve_handle(event_token);
+         if (ev) SetEvent(ev);
+     }
++    /* Xbox signals the file object when Event is NULL; XAPI then
++     * NtWaitForSingleObject(FileHandle). Signal our per-async-handle event. */
++    bridge_signal_async_file(file_token);
+     if (apc_routine) {
+-        if (g_defer_io_apc && g_io_apc_count < IO_APC_QUEUE) {
++        /* Async handles return STATUS_PENDING and XAPI WriteFileEx/ReadFileEx
++         * arms its wait *after* NtWriteFile returns. Delivering NtUserIoApcDispatcher
++         * (FE0000A0) inline races that setup — RedCard CREATING PROFILE hangs
++         * after Data00 write with apc=FE0000A0. Defer to the next alertable
++         * wait (KeDelayExecutionThread / NtWait*Ex), matching hardware. */
++        int defer = g_defer_io_apc || bridge_handle_is_async(file_token);
++        if (defer && g_io_apc_count < IO_APC_QUEUE) {
+             uint32_t *q = g_io_apc[g_io_apc_count++];
+             q[0] = apc_routine; q[1] = apc_context; q[2] = iostatus;
+         } else {
+@@ -4676,11 +4720,16 @@ static void bridge_RtlUnwind(void)
+  * no event, and the caller waits on the handle. Completing every read
+  * synchronously answers a different question than the one that was asked.
+  *
++ * Host CreateFile handles without FILE_FLAG_OVERLAPPED are not waitable, so
++ * each async token also gets an auto-reset completion event that waits use
++ * and that bridge_complete_file_io signals (Xbox file-object semantics).
++ *
+  * A flat array because a title has a handful of files open at once and a
+  * linear scan of sixty-four entries costs less than a hash would.
+  */
+ #define BRIDGE_ASYNC_MAX 64
+ static uint32_t g_async_handles[BRIDGE_ASYNC_MAX];
++static HANDLE   g_async_events[BRIDGE_ASYNC_MAX];
+ 
+ static void bridge_note_async_handle(uint32_t token)
+ {
+@@ -4690,15 +4739,47 @@ static void bridge_note_async_handle(uint32_t token)
+     for (i = 0; i < BRIDGE_ASYNC_MAX; i++)
+         if (g_async_handles[i] == token)
+             return;
+-    for (i = 0; i < BRIDGE_ASYNC_MAX; i++)
+-        if (!g_async_handles[i]) { g_async_handles[i] = token; return; }
++    for (i = 0; i < BRIDGE_ASYNC_MAX; i++) {
++        if (!g_async_handles[i]) {
++            /* Manual-reset: Xbox file objects stay signalled until the next
++             * I/O starts. Auto-reset could be consumed by one waiter while
++             * WriteFileEx still expected the handle to look complete. */
++            HANDLE ev = CreateEventW(NULL, TRUE, FALSE, NULL);
++            if (!ev)
++                return;
++            g_async_handles[i] = token;
++            g_async_events[i] = ev;
++            return;
++        }
++    }
++}
++
++static void bridge_reset_async_file(uint32_t token)
++{
++    int i;
++    if (!token)
++        return;
++    for (i = 0; i < BRIDGE_ASYNC_MAX; i++) {
++        if (g_async_handles[i] == token && g_async_events[i]) {
++            ResetEvent(g_async_events[i]);
++            return;
++        }
++    }
+ }
+ 
+ static void bridge_forget_async_handle(uint32_t token)
+ {
+     int i;
+-    for (i = 0; i < BRIDGE_ASYNC_MAX; i++)
+-        if (g_async_handles[i] == token) { g_async_handles[i] = 0; return; }
++    for (i = 0; i < BRIDGE_ASYNC_MAX; i++) {
++        if (g_async_handles[i] == token) {
++            g_async_handles[i] = 0;
++            if (g_async_events[i]) {
++                CloseHandle(g_async_events[i]);
++                g_async_events[i] = NULL;
++            }
++            return;
++        }
++    }
+ }
+ 
+ static int bridge_handle_is_async(uint32_t token)
+@@ -4712,13 +4793,47 @@ static int bridge_handle_is_async(uint32_t token)
+     return 0;
+ }
+ 
+-/* Off unless RECOMP_ASYNC_IO is set, so the two behaviours stay comparable
+- * rather than one being swapped in blind. */
++static void bridge_signal_async_file(uint32_t token)
++{
++    int i;
++    if (!token)
++        return;
++    for (i = 0; i < BRIDGE_ASYNC_MAX; i++) {
++        if (g_async_handles[i] == token && g_async_events[i]) {
++            SetEvent(g_async_events[i]);
++            return;
++        }
++    }
++}
++
++/* Waits on an async file token must use the completion event. */
++static HANDLE bridge_resolve_wait_handle(uint32_t token)
++{
++    int i;
++    if (token) {
++        for (i = 0; i < BRIDGE_ASYNC_MAX; i++) {
++            if (g_async_handles[i] == token && g_async_events[i])
++                return g_async_events[i];
++        }
++    }
++    return bridge_resolve_handle(token);
++}
++
++/* Default ON: async handles report STATUS_PENDING so callers take the
++ * wait-on-file path. RECOMP_ASYNC_IO=0 restores the old always-SUCCESS
++ * shortcut for bisection. */
+ static int bridge_async_io_enabled(void)
+ {
+     static int on = -1;
+-    if (on < 0)
+-        on = getenv("RECOMP_ASYNC_IO") ? 1 : 0;
++    if (on < 0) {
++        const char *e = getenv("RECOMP_ASYNC_IO");
++        if (!e)
++            on = 1;
++        else if (e[0] == '0' && e[1] == '\0')
++            on = 0;
++        else
++            on = 1;
++    }
+     return on;
+ }
+ 
+@@ -4740,6 +4855,7 @@ static void bridge_NtReadFile(void)
+         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
+         return;
+     }
++    bridge_reset_async_file(STACK_ARG(0));
+     if (offset_va) {
+         off.LowPart  = BRIDGE_MEM32(offset_va);
+         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
+@@ -4775,8 +4891,8 @@ static void bridge_NtReadFile(void)
+         fflush(stderr);
+     }
+     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
+-    bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
+-                            iostatus);
++    bridge_complete_file_io(STACK_ARG(0), STACK_ARG(1), STACK_ARG(2),
++                            STACK_ARG(3), iostatus);
+ 
+     /* An asynchronous request returns STATUS_PENDING, even when the data was
+      * already there.
+@@ -4815,6 +4931,7 @@ static void bridge_NtWriteFile(void)
+         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
+         return;
+     }
++    bridge_reset_async_file(STACK_ARG(0));
+     if (offset_va) {
+         off.LowPart  = BRIDGE_MEM32(offset_va);
+         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
+@@ -4822,9 +4939,29 @@ static void bridge_NtWriteFile(void)
+     }
+     g_eax = (uint32_t)xbox_NtWriteFile(handle, NULL, NULL, NULL, &ios,
+                 XBOX_TO_NATIVE(buffer_va), length, poff);
++    /* Profile create (and other XAPI saves) open Data00 async+NO_BUFFERING
++     * and wait on the Event/APC. Without a line here a failed or short write
++     * looked identical to "never wrote" in the session log. */
++    {
++        uint32_t got = (uint32_t)ios.Information;
++        if (poff)
++            fprintf(stderr, "  [WRITE] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X\n",
++                    g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
++                    (long long)off.QuadPart, length, got, (uint32_t)ios.Status);
++        else
++            fprintf(stderr, "  [WRITE] from=0x%08X ev=%08X apc=%08X @seq want=%u got=%u st=0x%08X\n",
++                    g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
++                    length, got, (uint32_t)ios.Status);
++        fflush(stderr);
++    }
+     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
+-    bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
+-                            iostatus);
++    bridge_complete_file_io(STACK_ARG(0), STACK_ARG(1), STACK_ARG(2),
++                            STACK_ARG(3), iostatus);
++
++    /* Mirror NtReadFile: an asynchronous handle reports STATUS_PENDING
++     * (default; RECOMP_ASYNC_IO=0 disables) even when the host write finished. */
++    if (bridge_async_io_enabled() && bridge_handle_is_async(STACK_ARG(0)))
++        g_eax = STATUS_PENDING;
+ }
+ 
+ /* ── NtQueryInformationFile (ordinal 211, 5 args = 20 bytes) */
+@@ -4985,6 +5122,9 @@ static void bridge_NtDeleteFile(void)
+ static void bridge_NtQueryDirectoryFile(void)
+ {
+     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
++    uint32_t event_tok   = STACK_ARG(1);
++    uint32_t apc_routine = STACK_ARG(2);
++    uint32_t apc_context = STACK_ARG(3);
+     uint32_t ios_va      = STACK_ARG(4);
+     uint32_t info_va     = STACK_ARG(5);
+     uint32_t length      = STACK_ARG(6);
+@@ -5004,10 +5144,23 @@ static void bridge_NtQueryDirectoryFile(void)
+         fn.Buffer        = fn_buf ? (PCHAR)XBOX_TO_NATIVE(fn_buf) : NULL;
+         if (fn.Buffer) pfn = &fn;
+     }
++    bridge_reset_async_file(STACK_ARG(0));
+     g_eax = (uint32_t)xbox_NtQueryDirectoryFile(handle, NULL, NULL, NULL, &ios,
+                 XBOX_TO_NATIVE(info_va), length, (XBOX_FILE_INFORMATION_CLASS)info_class,
+                 pfn, (BOOLEAN)restart);
+     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
++    /* Was dropping Event/APC on the floor (same class of hang as the old
++     * NtReadFile/NtWriteFile path). Also signals the async file-object wait
++     * event — profile create waits on the Data00/dir handle after I/O. */
++    fprintf(stderr, "  [DIR] QueryDirectory ev=%08X apc=%08X class=%u len=%u st=0x%08X info=%u async=%d\n",
++            event_tok, apc_routine, info_class, length,
++            (uint32_t)ios.Status, (uint32_t)ios.Information,
++            bridge_handle_is_async(STACK_ARG(0)));
++    fflush(stderr);
++    bridge_complete_file_io(STACK_ARG(0), event_tok, apc_routine, apc_context,
++                            ios_va);
++    if (bridge_async_io_enabled() && bridge_handle_is_async(STACK_ARG(0)))
++        g_eax = STATUS_PENDING;
+ }
+ 
+ /* ── NtOpenSymbolicLinkObject (ordinal 203, 2 args = 8 bytes) */
+@@ -5087,6 +5240,8 @@ static void bridge_IoCreateFile(void)
+     g_eax = (uint32_t)bridge_create_file_impl(
+         handle_va, access, obj_attrs, iostatus,
+         file_attrs, share, disposition, options, 0);
++    if (g_eax == 0 && handle_va && (options & 0x30u) == 0u)
++        bridge_note_async_handle(BRIDGE_MEM32(handle_va));
+ }
+ 
+ /* -- NtDeviceIoControlFile (ordinal 196, 10 args = 40 bytes) ----
+@@ -5906,7 +6061,7 @@ static void bridge_KeWaitForMultipleObjects(void)
+         } else {
+             handles[i] = ke_shadow_lookup(object);
+             if (!handles[i])
+-                handles[i] = bridge_resolve_handle(object);
++                handles[i] = bridge_resolve_wait_handle(object);
+         }
+     }
+ 
+diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
+index 2991d89..165b369 100644
+--- a/src/kernel/kernel_file.c
++++ b/src/kernel/kernel_file.c
+@@ -467,8 +467,18 @@ NTSTATUS __stdcall xbox_NtWriteFile(
+         return STATUS_SUCCESS;
+     }
+ 
+-    XBOX_TRACE(XBOX_LOG_FILE, "NtWriteFile(handle=%p, len=%u) failed err=%u",
+-               FileHandle, Length, GetLastError());
++    /* WARN, not TRACE: a failed write on an async+NO_BUFFERING save handle
++     * (RedCard profile Data00) previously vanished from session logs and left
++     * "CREATING PROFILE…" waiting on completion that never arrived. */
++    {
++        DWORD err = GetLastError();
++        xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
++                 "NtWriteFile(handle=%p, len=%u) failed err=%u",
++                 FileHandle, Length, err);
++        fprintf(stderr, "  [FILE] NtWriteFile FAILED len=%u err=%u\n",
++                Length, err);
++        fflush(stderr);
++    }
+     IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
+     IoStatusBlock->Information = 0;
+     return STATUS_UNSUCCESSFUL;
+diff --git a/src/kernel/kernel_memory.c b/src/kernel/kernel_memory.c
+index e66e3de..0696407 100644
+--- a/src/kernel/kernel_memory.c
++++ b/src/kernel/kernel_memory.c
+@@ -182,9 +182,13 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
+     uint32_t va = (uint32_t)(uintptr_t)BaseAddress;
+     if (va >= XBOX_CONTIG_BASE &&
+             (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
++    {
++        xbox_PhysNoteContiguousName(va);
+         return (ULONG_PTR)(va - XBOX_CONTIG_BASE);
++    }
+     /* The same number can be a window page; record that the title meant RAM
+      * (xbox_PhysNoteRamName says why the APU needs to know). */
++    xbox_PhysNoteImageName(va);
+     xbox_PhysNoteRamName(va);
+     return (ULONG_PTR)va;
+ }
+diff --git a/src/kernel/kernel_path.c b/src/kernel/kernel_path.c
+index 3c719cf..7b81da2 100644
+--- a/src/kernel/kernel_path.c
++++ b/src/kernel/kernel_path.c
+@@ -516,25 +516,33 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
+     /* RECOMP_SAVE_DIR: the root for the title's UDATA, TDATA and CACHE,
+      * created if missing. Absolute; under Wine a DOS path (Z:\home\...) is safest. */
+     {
+-        const char *ov = getenv("RECOMP_SAVE_DIR");
++        /* getenv converts the Windows Unicode environment through the ANSI
++         * code page. Treating those bytes as UTF-8 corrupted non-ASCII save
++         * roots before the title could open TDATA. Keep this path wide. */
++        const WCHAR *ov = _wgetenv(L"RECOMP_SAVE_DIR");
+         /* Room for the longest suffix the rules append (UDATA\<title id>\
+          * <save>\<file>); a longer root would only truncate later. */
+-        int n = (ov && ov[0])
+-              ? MultiByteToWideChar(CP_UTF8, 0, ov, -1, s_user_dir, MAX_PATH) : 0;
++        size_t n = (ov && ov[0]) ? wcslen(ov)+1 : 0;
+         if (ov && ov[0] && (n == 0 || n > MAX_PATH - 96)) {
+-            xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH,
+-                     "RECOMP_SAVE_DIR %s: %s; using the default save dir",
+-                     ov, n == 0 ? "conversion failed (longer than MAX_PATH?)" : "too long for the paths under it");
++            fprintf(stderr,"[PATH] RECOMP_SAVE_DIR is too long for title data; using the default save dir\n");
+             ov = NULL;
+         }
+         if (ov && ov[0]) {
++            wcscpy_s(s_user_dir, MAX_PATH, ov);
+             for (WCHAR *p = s_user_dir; *p; p++)
+                 if (*p == L'/') *p = L'\\';
+             len = wcslen(s_user_dir);
+             if (len > 3 && s_user_dir[len - 1] == L'\\')
+                 s_user_dir[len - 1] = L'\0';
+-            SHCreateDirectoryExW(NULL, s_user_dir, NULL);
+-        } else {
++            int error = SHCreateDirectoryExW(NULL, s_user_dir, NULL);
++            DWORD attr = GetFileAttributesW(s_user_dir);
++            if ((error != ERROR_SUCCESS && error != ERROR_ALREADY_EXISTS && error != ERROR_FILE_EXISTS)
++                || attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
++                fprintf(stderr,"[PATH] Cannot create RECOMP_SAVE_DIR (Win32 %d); using the default save dir\n",error);
++                ov = NULL;
++            }
++        }
++        if (!ov || !ov[0]) {
+             wcscpy_s(s_user_dir, MAX_PATH, s_save_dir);
+         }
+ 
+diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
+index 87788ed..211da29 100644
+--- a/src/kernel/nv2a_backend.h
++++ b/src/kernel/nv2a_backend.h
+@@ -20,14 +20,16 @@
+  * so a back end only ever sees surface pixels. Blend, depth, alpha, cull and
+  * stencil state arrive in Nv2aRenderState.
+  *
+- * ponytail: register-combiner state and texture stages 1-3 are not passed on:
+- * a back end sees stage 0 and the diffuse colour. Extend Nv2aBatch when that
+- * matters rather than adding callbacks.
++ * Transformed 3D batches also carry the register combiners, four texture
++ * stages and the original shader outputs. Screen-space batches retain the
++ * simple stage-0 path. Callback data is valid only for the duration of draw().
+  */
+ #ifndef NV2A_BACKEND_H
+ #define NV2A_BACKEND_H
+ 
+ #include <stdint.h>
++#include "nv2a_gpu_vs.h"
++#include "nv2a_combiner.h"
+ 
+ /* The colour surface being drawn into, in real (anti-aliased) pixels.
+  * aa_sx/aa_sy give the anti-aliasing factor, so width/aa_sx is the logical
+@@ -38,6 +40,12 @@ typedef struct {
+     uint32_t pitch;             /* bytes per row */
+     uint32_t bytes_per_pixel;   /* 2 or 4 */
+     uint32_t aa_sx, aa_sy;      /* 1 or 2 each */
++    /* Swizzled colour surface (SURFACE_FORMAT type 2, render-to-texture):
++     * its power-of-two size; pixel (x, y) lives at that size's Morton offset
++     * in guest memory, as a swizzled texture reads it. 0 for a linear
++     * (pitched) surface. A back end that copies the surface to or from guest
++     * memory must use that layout, or the texture comes back scrambled. */
++    uint32_t swizzle_w, swizzle_h;
+ } Nv2aSurface;
+ 
+ /* A texture as the title programmed it. uv in Nv2aVertex are in texels. */
+@@ -51,6 +59,7 @@ typedef struct {
+      * a linear texture) and the raw SET_TEXTURE_FILTER word (MIN in bits
+      * 16-23). A back end that ignores them samples level 0. */
+     uint32_t levels, filter;
++    uint32_t palette;           /* guest CLUT address for indexed textures */
+ } Nv2aTexture;
+ 
+ typedef struct {
+@@ -58,6 +67,7 @@ typedef struct {
+     float    rhw;               /* 1/w, 1 for pre-transformed batches */
+     uint32_t diffuse;           /* 0xAARRGGBB */
+     float    u, v;              /* texels */
++    float    d1[4], tex[4][4], fog; /* original transformed shader outputs */
+ } Nv2aVertex;
+ 
+ /* Render state as the title set it, in NV2A's own (OpenGL) enum values:
+@@ -87,6 +97,11 @@ typedef struct {
+     uint32_t           count;
+     const Nv2aTexture *texture;     /* NULL: untextured */
+     const Nv2aRenderState *state;
++    const Nv2aCombiner *combiner;  /* NULL for the simple screen-space path */
++    const Nv2aTexture *stages;     /* four entries when combiner is non-NULL */
++    uint32_t stage_valid;
++    float fog_color[4];
++    const Nv2aGpuVs *gpu; /* optional raw vertex program, synchronous lifetime */
+ } Nv2aBatch;
+ 
+ typedef struct {
+@@ -96,6 +111,7 @@ typedef struct {
+                   uint32_t flags, uint32_t argb, uint32_t zstencil);
+     void (*draw)(const Nv2aSurface *s, const Nv2aBatch *b);
+     void (*flip)(void);
++    int (*gpu_probe)(const Nv2aGpuVs *program);
+ } Nv2aBackend;
+ 
+ /* Register (or, with NULL, remove) the back end. Call before the title starts
+diff --git a/src/kernel/nv2a_gpu_vs.h b/src/kernel/nv2a_gpu_vs.h
+new file mode 100644
+index 0000000..ad6f984
+--- /dev/null
++++ b/src/kernel/nv2a_gpu_vs.h
+@@ -0,0 +1,32 @@
++/* Adapted from the NHL Hitz 2003 recompilation GPU vertex interface. */
++#ifndef REDCARD_NV2A_GPU_VS_H
++#define REDCARD_NV2A_GPU_VS_H
++#include <stdint.h>
++#include <stddef.h>
++#define NV2A_VSH_SLOTS_MAX 136
++#define GVS_OFF_CONST 0u
++#define GVS_OFF_ATTR  3072u
++#define GVS_OFF_IMM   3328u
++#define GVS_OFF_IDX   3584u
++
++typedef struct {
++    uint32_t prog[NV2A_VSH_SLOTS_MAX][4];   /* microcode, start slot .. FINAL */
++    uint32_t nslots, hash, input_mask;
++    uint32_t fixed_function;                /* project FFP shader, constants packed by executor */
++    const uint8_t *block;                   /* valid inside draw() only */
++    uint32_t block_bytes;
++    uint32_t nidx;                          /* indices = vertices drawn */
++    float    aa_sx, aa_sy;
++    uint32_t fog_mode;                      /* 0: fog off, else the NV097 fog mode word */
++    float    fog_px, fog_py;
++    uint32_t verify;                        /* RECOMP_GPUVS_VERIFY: read the outputs back */
++    float   *verify_out;                    /* min(nidx, 4096) x 29 floats, or NULL */
++    uint32_t *verify_count;                 /* points actually read back; 0 if draw/readback was skipped */
++} Nv2aGpuVs;
++
++int nv2a_vsh_export(Nv2aGpuVs *e);
++/* Fixed-function GPU path: no microcode; constants packed by the executor. */
++int nv2a_vsh_export_ffp(Nv2aGpuVs *e, uint32_t input_mask, uint32_t variant);
++int nv2a_vsh_gen_hlsl(const Nv2aGpuVs *e, char *out, size_t cap);
++
++#endif
+diff --git a/src/kernel/nv2a_gvs_exec.inc b/src/kernel/nv2a_gvs_exec.inc
+new file mode 100644
+index 0000000..234b3b7
+--- /dev/null
++++ b/src/kernel/nv2a_gvs_exec.inc
+@@ -0,0 +1,299 @@
++/* GPU vertex-program handoff adapted from the Hitz port's raw-span packer.
++ * Unsupported programs/arrays retain the CPU path. No guest pointer survives draw. */
++#define GVS_BLOCK_MAX (6u<<20)
++typedef struct { uint64_t lo,hi;uint32_t attr; } GvsSeg;
++static Nv2aGpuVs s_gvs;
++static uint8_t *s_gvs_blk;
++static float s_gvs_vout[4096*29];
++static unsigned long s_gvs_draws,s_gvs_checked,s_gvs_bad;
++enum { GF_ATTR,GF_SPARSE,GF_BIG,GF_OFF,GF_NOPROG,GF_NORC,GF_NBACKEND,GF_SMALL,
++       GF_ZORIGIN,GF_PRIM,GF_NIDX,GF_EXPORT,GF_PROBE,GF_NOMEM,GF_NREASON };
++static unsigned long s_gvs_skip[GF_NREASON];
++static int gvs_stats_on(void)
++{
++    static int v=-1;
++    if(v<0){const char *e=getenv("RECOMP_GVS_STATS");v=e&&e[0]&&e[0]!='0';}
++    return v;
++}
++static void gvs_stats_maybe(void)
++{
++    static unsigned long last;
++    unsigned long total=s_gvs_checked;
++    if(!gvs_stats_on() || total<500 || total-last<2000)return;
++    last=total;
++    fprintf(stderr,
++        "[GVS] checked=%lu ok=%lu bad=%lu skip off=%lu noprog=%lu norc=%lu "
++        "nbackend=%lu small=%lu zorigin=%lu prim=%lu nidx=%lu export=%lu "
++        "probe=%lu nomem=%lu attr=%lu sparse=%lu big=%lu\n",
++        s_gvs_checked,s_gvs_draws,s_gvs_bad,
++        s_gvs_skip[GF_OFF],s_gvs_skip[GF_NOPROG],s_gvs_skip[GF_NORC],
++        s_gvs_skip[GF_NBACKEND],s_gvs_skip[GF_SMALL],s_gvs_skip[GF_ZORIGIN],
++        s_gvs_skip[GF_PRIM],s_gvs_skip[GF_NIDX],s_gvs_skip[GF_EXPORT],
++        s_gvs_skip[GF_PROBE],s_gvs_skip[GF_NOMEM],s_gvs_skip[GF_ATTR],
++        s_gvs_skip[GF_SPARSE],s_gvs_skip[GF_BIG]);
++    fflush(stderr);
++}
++static int gvs_fail(int reason,uint32_t n)
++{
++    if((unsigned)reason<(unsigned)GF_NREASON)s_gvs_skip[reason]++;
++    (void)n;gvs_stats_maybe();return 0;
++}
++/* Pack FFP constants into the GPU-VS constant block (see gen_ffp_body). */
++static void gvs_pack_ffp_constants(float *dst, uint32_t ca_idx, uint32_t ta_idx)
++{
++    const float *off = nv2a_vsh_constant(59);
++    const float *mv = (const float *)&s_reg[0x0480 / 4];
++    uint32_t cfg, mask = s_reg[0x03BC / 4], colmat = s_reg[0x0298 / 4];
++    int lit = s_reg[0x0314 / 4] && s_gpu.attr[2].size;
++    int i;
++
++    memset(dst, 0, NV2A_VSH_CONSTANTS * 16u);
++    memcpy(dst, s_gpu.composite, 64);
++    dst[16] = off[0]; dst[17] = off[1]; dst[18] = off[2];
++    cfg = (lit ? 1u : 0u)
++        | (ffp_flip_normals() ? 2u : 0u)
++        | ((ca_idx & 15u) << 8)
++        | ((ta_idx & 15u) << 12)
++        | (((colmat >> 2) & 3u) << 16)
++        | (((colmat >> 4) & 3u) << 18);
++    memcpy(&dst[20], &cfg, 4);
++    dst[21] = reg_f(0x0A10); dst[22] = reg_f(0x0A14); dst[23] = reg_f(0x0A18);
++    if (lit) {
++        memcpy(dst + 24, mv, 64);
++        for (i = 0; i < NV_LIGHTS; i++) {
++            uint32_t kind = (mask >> (2 * i)) & 3u, b = 0x1000 + (uint32_t)i * 0x80;
++            float *L = dst + 40 + i * 16; /* K(10+i*4) */
++            if (!kind) continue;
++            L[0] = reg_f(b + 0x00); L[1] = reg_f(b + 0x04); L[2] = reg_f(b + 0x08);
++            L[3] = (float)kind;
++            L[4] = reg_f(b + 0x0C); L[5] = reg_f(b + 0x10); L[6] = reg_f(b + 0x14);
++            L[7] = reg_f(b + 0x24); /* range */
++            if (kind == 1u) {
++                L[8] = reg_f(b + 0x34); L[9] = reg_f(b + 0x38); L[10] = reg_f(b + 0x3C);
++            } else {
++                L[8] = reg_f(b + 0x5C); L[9] = reg_f(b + 0x60); L[10] = reg_f(b + 0x64);
++            }
++            L[11] = reg_f(b + 0x68);
++            L[12] = reg_f(b + 0x6C); L[13] = reg_f(b + 0x70);
++        }
++        dst[168] = reg_f(0x03B4); /* K(42).x material alpha */
++    }
++}
++
++static int gvs_try(void)
++{
++    uint32_t n=s_gpu.idx_count,nidx=0,i,a,minidx=0xffffffffu,maxidx=0;
++    uint32_t nseg=0,nm=0,attr_seg[16],segpos[16],ni,pos,*desc,*ib,vcount=0;
++    GvsSeg seg[16],mseg[16];uint64_t copied=0;float *imm;const uint8_t *mem;
++    static int enabled=-1,verify=-1;
++    int is_ffp=0; uint32_t ca_idx=3, ta_idx=9, ffp_variant=0;
++    s_gvs_checked++;
++    if(enabled<0){const char *v=getenv("RECOMP_D3D11_GPUVS");enabled=v&&atoi(v)!=0;}
++    if(!enabled)return gvs_fail(GF_OFF,n);
++    {
++        static int ffp_gvs = -1;
++        if (ffp_gvs < 0) {
++            const char *e = getenv("RECOMP_GVS_FFP");
++            /* Default off: mul(M,v) fixes the wipeout, but some FFP meshes
++             * (shadow-like lattice) still glitch vs CPU. Opt in with =1. */
++            ffp_gvs = e && e[0] && e[0] != '0';
++        }
++        is_ffp = ffp_gvs && batch_is_ffp();
++    }
++    if(!batch_uses_program() && !is_ffp)return gvs_fail(GF_NOPROG,n);
++    if(!s_gpu.rc_seen)return gvs_fail(GF_NORC,n);
++    if(!s_backend || !s_backend->gpu_probe)return gvs_fail(GF_NBACKEND,n);
++    if(n<3)return gvs_fail(GF_SMALL,n);
++    /* CPU clipping adjusts a nonzero viewport depth origin; defer this case. */
++    if(nv2a_vsh_constant(59)[2]!=0.0f)return gvs_fail(GF_ZORIGIN,n);
++    switch(s_gpu.prim) {
++    case NV_PRIM_TRIANGLES:nidx=n-n%3;break;
++    case NV_PRIM_TRIANGLE_STRIP:case NV_PRIM_TRIANGLE_FAN:case NV_PRIM_POLYGON:nidx=3*(n-2);break;
++    case NV_PRIM_QUADS:nidx=6*(n/4);break;
++    case NV_PRIM_QUAD_STRIP:nidx=6*((n-2)/2);break;
++    default:return gvs_fail(GF_PRIM,n);
++    }
++    if(!nidx || nidx>(GVS_BLOCK_MAX-GVS_OFF_IDX)/4)return gvs_fail(GF_NIDX,n);
++    memset(&s_gvs,0,sizeof s_gvs);
++    if(is_ffp) {
++        uint32_t mask = 1u; /* position */
++        const VertexAttr *ca = color_attr(), *ta = texcoord_attr();
++        ca_idx = (uint32_t)(ca - s_gpu.attr);
++        ta_idx = (uint32_t)(ta - s_gpu.attr);
++        if (ca_idx >= NV2A_VSH_INPUTS) ca_idx = 3;
++        if (ta_idx >= NV2A_VSH_INPUTS) ta_idx = 9;
++        mask |= 1u << ca_idx;
++        mask |= 1u << ta_idx;
++        if (s_reg[0x0314 / 4] && s_gpu.attr[2].size)
++            mask |= 1u << 2;
++        for (i = 1; i < 4; i++)
++            if (s_gpu.attr[9 + i].size)
++                mask |= 1u << (9 + i);
++        ffp_variant = mask
++            | ((s_reg[0x0314 / 4] && s_gpu.attr[2].size) ? 0x10000u : 0)
++            | (ffp_flip_normals() ? 0x20000u : 0)
++            | ((s_reg[0x0298 / 4] & 0x3Cu) << 14);
++        if (!nv2a_vsh_export_ffp(&s_gvs, mask, ffp_variant))
++            return gvs_fail(GF_EXPORT, n);
++    } else if (!nv2a_vsh_export(&s_gvs)) {
++        return gvs_fail(GF_EXPORT, n);
++    }
++    if(verify<0){const char *v=getenv("RECOMP_GPUVS_VERIFY");verify=v&&atoi(v)!=0;}
++    s_gvs.verify=verify && (s_gvs_draws<60 || s_gvs_draws%250==0);
++    s_gvs.verify_out=s_gvs_vout;s_gvs.verify_count=&vcount;
++    if(!s_backend->gpu_probe(&s_gvs))return gvs_fail(GF_PROBE,n);
++    if(!s_gvs_blk && !(s_gvs_blk=malloc(GVS_BLOCK_MAX)))return gvs_fail(GF_NOMEM,n);
++    for (i = 0; i < n; i++) {
++        if (s_gpu.idx[i] < minidx) minidx = s_gpu.idx[i];
++        if (s_gpu.idx[i] > maxidx) maxidx = s_gpu.idx[i];
++    }
++    mem = (const uint8_t *)xbox_GetMemoryOffset();
++    imm = (float *)(s_gvs_blk + GVS_OFF_IMM);
++    desc = (uint32_t *)(s_gvs_blk + GVS_OFF_ATTR);
++    memset(desc, 0, 16 * 16);
++    for (a = 0; a < NV2A_VSH_INPUTS; a++) {
++        imm[a * 4 + 0] = imm[a * 4 + 1] = imm[a * 4 + 2] = 0.0f;
++        imm[a * 4 + 3] = 1.0f;
++        desc[a * 4 + 3] = 1;                     /* constant unless a fetch below says otherwise */
++        attr_seg[a] = 0xFFFFFFFFu;
++    }
++    for (a = 0; a < NV2A_VSH_INPUTS; a++) {
++        const VertexAttr *at = &s_gpu.attr[a];
++        uint32_t elem;
++        uint64_t lo, hi;
++
++        if (!((s_gvs.input_mask >> a) & 1u))
++            continue;
++        if (!at->size && a < NV_VERTEX_ATTRS) {
++            memcpy(&imm[a * 4], s_gpu.imm_attr[a], 16);
++            continue;
++        }
++        if (!at->size || !at->stride)
++            continue;
++        if (!(at->type <= 2 || at->type == 4 || at->type == 5 || at->type == 6))
++            continue;                            /* fetch_attr: unsupported type reads as absent */
++        elem = attr_elem_bytes(at);
++        lo = (uint64_t)at->offset + (uint64_t)minidx * at->stride;
++        hi = (uint64_t)at->offset + (uint64_t)maxidx * at->stride + elem;
++        if (s_gpu.inline_active) {
++            if (hi > (uint64_t)s_gpu.inline_count * 4)
++                return gvs_fail(GF_ATTR, n);
++        } else {
++            if (!at->offset || !guest_span_ok(lo, elem) || !guest_span_ok(hi - elem, elem))
++                return gvs_fail(GF_ATTR, n);
++        }
++        seg[nseg].lo = lo; seg[nseg].hi = hi; seg[nseg].attr = a; nseg++;
++    }
++    /* sort by lo, merge near ones */
++    for (i = 1; i < nseg; i++) {
++        uint32_t j = i;
++        GvsSeg t = seg[i];
++        while (j && seg[j - 1].lo > t.lo) { seg[j] = seg[j - 1]; j--; }
++        seg[j] = t;
++    }
++    for (i = 0; i < nseg; i++) {
++        if (nm && seg[i].lo <= mseg[nm - 1].hi + 64) {
++            if (seg[i].hi > mseg[nm - 1].hi) mseg[nm - 1].hi = seg[i].hi;
++        } else {
++            mseg[nm].lo = seg[i].lo; mseg[nm].hi = seg[i].hi; nm++;
++        }
++        attr_seg[seg[i].attr] = nm - 1;
++    }
++    for (i = 0; i < nm; i++)
++        copied += mseg[i].hi - mseg[i].lo;
++    if (copied > 32768u + 16u * (uint64_t)n)
++        return gvs_fail(GF_SPARSE, n);
++
++    ni = (nidx * 4u + 15u) & ~15u;
++    pos = GVS_OFF_IDX + ni;
++    for (i = 0; i < nm; i++) {
++        uint64_t len = mseg[i].hi - mseg[i].lo;
++        uint32_t p = (pos + 15u) & ~15u;
++        p += (uint32_t)(mseg[i].lo & 15u);
++        if ((uint64_t)p + len > GVS_BLOCK_MAX)
++            return gvs_fail(GF_BIG, n);
++        memcpy(s_gvs_blk + p, (s_gpu.inline_active ? (const uint8_t *)s_gpu.inline_buf : mem) + mseg[i].lo, (size_t)len);
++        segpos[i] = p;
++        pos = p + (uint32_t)len;
++    }
++    for (a = 0; a < NV2A_VSH_INPUTS; a++) {
++        const VertexAttr *at = &s_gpu.attr[a];
++        uint32_t m = attr_seg[a];
++        if (m == 0xFFFFFFFFu)
++            continue;
++        desc[a * 4 + 0] = (uint32_t)((uint64_t)segpos[m] + (uint64_t)at->offset - mseg[m].lo);
++        desc[a * 4 + 1] = at->stride;
++        desc[a * 4 + 2] = at->type | (at->size < 4 ? at->size : 4u) << 8;
++        desc[a * 4 + 3] = 0;
++    }
++    if (is_ffp)
++        gvs_pack_ffp_constants((float *)(s_gvs_blk + GVS_OFF_CONST), ca_idx, ta_idx);
++    else
++        memcpy(s_gvs_blk + GVS_OFF_CONST, nv2a_vsh_constant(0), NV2A_VSH_CONSTANTS * 16u);
++
++    /* triangle-list index array, in the CPU path's assembly order */
++    ib = (uint32_t *)(s_gvs_blk + GVS_OFF_IDX);
++    {
++        uint32_t o = 0;
++        switch (s_gpu.prim) {
++        case NV_PRIM_TRIANGLES:
++            for (i = 0; i + 2 < n; i += 3) { ib[o++] = s_gpu.idx[i]; ib[o++] = s_gpu.idx[i+1]; ib[o++] = s_gpu.idx[i+2]; }
++            break;
++        case NV_PRIM_TRIANGLE_STRIP:
++            for (i = 0; i + 2 < n; i++) { uint32_t alt=(i&1) && strip_alt_winding();ib[o++]=s_gpu.idx[i+alt];ib[o++]=s_gpu.idx[i+1-alt];ib[o++]=s_gpu.idx[i+2]; }
++            break;
++        case NV_PRIM_TRIANGLE_FAN:
++        case NV_PRIM_POLYGON:
++            for (i = 1; i + 1 < n; i++) { ib[o++] = s_gpu.idx[0]; ib[o++] = s_gpu.idx[i]; ib[o++] = s_gpu.idx[i+1]; }
++            break;
++        case NV_PRIM_QUADS:
++            for (i = 0; i + 3 < n; i += 4) {
++                ib[o++] = s_gpu.idx[i]; ib[o++] = s_gpu.idx[i+1]; ib[o++] = s_gpu.idx[i+2];
++                ib[o++] = s_gpu.idx[i]; ib[o++] = s_gpu.idx[i+2]; ib[o++] = s_gpu.idx[i+3];
++            }
++            break;
++        case NV_PRIM_QUAD_STRIP:
++            for (i = 0; i + 3 < n; i += 2) {
++                ib[o++] = s_gpu.idx[i]; ib[o++] = s_gpu.idx[i+1]; ib[o++] = s_gpu.idx[i+3];
++                ib[o++] = s_gpu.idx[i]; ib[o++] = s_gpu.idx[i+3]; ib[o++] = s_gpu.idx[i+2];
++            }
++            break;
++        default: break;
++        }
++    }
++    s_gvs.block = s_gvs_blk;
++    s_gvs.block_bytes = pos;
++
++    s_gvs.nidx = nidx;
++    s_gvs.aa_sx = s_gpu.aa_sx;
++    s_gvs.aa_sy = s_gpu.aa_sy;
++    s_gvs.fog_mode = s_gpu.fog_enable ? (s_gpu.fog_mode ? s_gpu.fog_mode : 1u) : 0u;
++    s_gvs.fog_px = s_gpu.fog_param[0];
++    s_gvs.fog_py = s_gpu.fog_param[1];
++
++
++    s_gpu.batches_program++;s_gpu.verts_program+=n;
++    s_active_gpu=&s_gvs;s_bcount=nidx;backend_flush(1);s_active_gpu=NULL;
++    s_gvs_draws++;
++    if(s_gvs.verify && vcount) {
++        uint32_t k,c,bad=0;
++        s_gvs_checked++;
++        for(k=0;k<vcount;k++) {
++            Nv2aVshOutput out;float want[29];
++            if(!transform_vertex(ib[k],&out))continue;
++            memcpy(want,out.pos,16);memcpy(want+4,out.d0,16);memcpy(want+8,out.d1,16);
++            memcpy(want+12,out.tex,64);want[28]=fog_factor(out.fog[0]);
++            for(c=0;c<29;c++) {
++                float w=want[c],g=s_gvs_vout[k*29+c];
++                if((isnan(w)&&isnan(g)) || (isinf(w)&&w==g))continue;
++                if(!(fabs((double)w-g)<=1e-3*fmax(1.0,fabs((double)w))+2e-3)) {
++                    if(s_gvs_bad<12 && bad<3)fprintf(stderr,"[GPUVS-VERIFY] hash=%08X vertex=%u component=%u cpu=%g gpu=%g\n",s_gvs.hash,k,c,w,g);
++                    bad++;
++                }
++            }
++        }
++        if(bad)s_gvs_bad++;
++        fprintf(stderr,"[GPUVS-VERIFY] compared=%lu mismatching_draws=%lu latest_components=%u\n",s_gvs_checked,s_gvs_bad,bad);
++    } else if(s_gvs.verify)fprintf(stderr,"[GPUVS-VERIFY] MISSING readback hash=%08X\n",s_gvs.hash);
++    return 1;
++}
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index a5ea9cc..5addeca 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -209,6 +209,7 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
+  * flip (nv2a_flip_hold.h). The swap's interval comes from the NO_OPERATION
+  * D3D pushes before it, software method 1. */
+ #define NV097_NO_OPERATION                0x0100
++#define NV097_WAIT_FOR_IDLE               0x0110
+ #define NV097_SET_FLIP_READ               0x0120
+ #define NV097_SET_FLIP_WRITE              0x0124
+ #define NV097_SET_FLIP_MODULO             0x0128
+@@ -806,6 +807,11 @@ static void current_surface(Nv2aSurface *out)
+     out->bytes_per_pixel = surface_bpp();
+     out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
+     out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
++    out->swizzle_w = out->swizzle_h = 0;
++    if (((s_gpu.format >> 8) & 0xF) == 2) {             /* swizzled */
++        out->swizzle_w = 1u << ((s_gpu.format >> 16) & 0xF);
++        out->swizzle_h = 1u << ((s_gpu.format >> 24) & 0xF);
++    }
+ }
+ 
+ /* Render state in the NV2A's own values, gathered from what the executor
+@@ -856,7 +862,7 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
+     s_gpu.texs[0].color  = tex->color;
+     s_gpu.texs[0].addr_u = 3;
+     s_gpu.texs[0].addr_v = 3;
+-    s_gpu.texs[0].palette = 0;          /* ponytail: no palettised formats */
++    s_gpu.texs[0].palette = tex->palette;
+     s_gpu.texs[0].levels = 1;
+     s_gpu.texs[0].filter = 0;
+     s_gpu.texs[0].cube   = 0;
+@@ -1883,12 +1889,24 @@ static uint32_t vertex_color(uint32_t index)
+  * coordinates are taken from the attribute streams as they are), no fog
+  * coordinate, no specular, no point sprites. */
+ 
+-/* Is this batch transformed by the fixed-function unit? Inline-array batches
+- * are left to the screen-space path, as they were before. */
++/* Is this batch transformed by the fixed-function unit? Inline-array
++ * (DrawPrimitiveUP-style) batches are transformed too: fetch_attr reads their
++ * payload like any vertex array, and the hardware does not care how vertices
++ * arrived. Leaving them to the screen-space path drew RedCard's world-space
++ * stadium banner (x +-1750, z +-1375) as pixels across the top of every match
++ * frame. Pre-transformed (XYZRHW) vertices do not come this way: XDK D3D
++ * draws them with a pass-through vertex program. RECOMP_FFP_INLINE=0 restores
++ * the old screen-space treatment. */
+ static int batch_is_ffp(void)
+ {
++    static int ffp_inline = -1;
++
++    if (ffp_inline < 0) {
++        const char *e = getenv("RECOMP_FFP_INLINE");
++        ffp_inline = !(e && e[0] == '0');
++    }
+     return s_gpu.composite_set && (s_gpu.xf_mode & 3) != 2
+-        && !s_gpu.inline_active;
++        && (ffp_inline || !s_gpu.inline_active);
+ }
+ 
+ /* Fixed-function vertex lighting (SET_LIGHTING_ENABLE).
+@@ -2035,8 +2053,18 @@ static int ffp_vertex(uint32_t index, Nv2aVshOutput *out)
+      * the eye -- X-Men Legends' street and sidewalk meshes, which extend past
+      * a top-down camera. Only w = 0 has no image. */
+     w = clip[3];
+-    if (fabsf(w) <= 1e-6f)
+-        return 0;
++    /* w = 0 (the eye plane) has no screen image, but returning 0 here drops
++     * the whole batch: RedCard's sky dome is centred on the camera, so in its
++     * level close-up shots the dome's horizon ring sits in the eye plane and
++     * the sky vanished on alternate frames -- dark gaps flashing through the
++     * stadium roof. Keep the vertex with a tiny w of the same sign: it is
++     * behind the near plane (NV_CLIP_W) and raster_xf_clipped cuts it there,
++     * interpolating in (x*w, y*w, z*w, w), which stays exact. */
++    if (!(fabsf(w) > 1e-6f)) {
++        if (w != w)
++            return 0;                      /* NaN: no position at all */
++        w = signbit(w) ? -1e-6f : 1e-6f;
++    }
+ 
+     memset(out, 0, sizeof *out);
+     out->pos[0] = (clip[0] / w + off[0]) * s_gpu.aa_sx;
+@@ -2148,6 +2176,8 @@ static void dump_surface_bmp(void);
+ /* A fixed-function batch without texture coordinates is drawn untextured, as
+  * the screen-space path does, whatever stale texture the stage still holds. */
+ static int s_xf_no_tex;
++static float fog_factor(float d);
++static int batch_uses_program(void);
+ 
+ /* Triangles bound for a back end: collected for the whole batch, handed over
+  * in one draw() call by backend_flush(). Whatever feeds them -- the program
+@@ -2183,25 +2213,51 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
+     o->diffuse = pack_color(v->d0);
+     o->u = v->tex[0][0] * su;
+     o->v = v->tex[0][1] * sv;
++    memcpy(o->d1, v->d1, sizeof o->d1);
++    memcpy(o->tex, v->tex, sizeof o->tex);
++    o->fog = fog_factor(v->fog[0]);
+ }
+ 
+ /* `textured`: the batch carried texture coordinates, so the bound texture is
+  * part of it. */
++static const Nv2aGpuVs *s_active_gpu;
+ static void backend_flush(int textured)
+ {
+     Nv2aSurface surf;
+     Nv2aRenderState rs;
+     Nv2aTexture tex;
+     Nv2aBatch batch;
++    Nv2aTexture stages[4];
++    unsigned st;
+ 
+     if (!s_bcount)
+         return;
+     current_surface(&surf);
+     current_render_state(&rs);
++    batch.gpu = s_active_gpu;
+     batch.vertices = s_bverts;
+     batch.count = s_bcount;
+     batch.texture = NULL;
+     batch.state = &rs;
++    batch.combiner = NULL;
++    batch.stages = NULL;
++    batch.stage_valid = 0;
++    memset(batch.fog_color, 0, sizeof batch.fog_color);
++    if (s_gpu.rc_seen && (batch_uses_program() || batch_is_ffp())) {
++        batch.combiner = &s_gpu.rc;
++        batch.stages = stages;
++        nv2a_rc_unpack(s_gpu.fog_color, batch.fog_color);
++        { float r = batch.fog_color[0]; batch.fog_color[0]=batch.fog_color[2]; batch.fog_color[2]=r; }
++        memset(stages, 0, sizeof stages);
++        for(st=0;st<4;st++) {
++            const Texture *t=&s_gpu.texs[st];
++            if(t->valid)batch.stage_valid |= 1u<<st;
++            stages[st].offset=t->offset;stages[st].width=t->width;stages[st].height=t->height;
++            stages[st].pitch=t->pitch;stages[st].color=t->color;
++            stages[st].addr_u=t->addr_u;stages[st].addr_v=t->addr_v;
++            stages[st].levels=t->levels;stages[st].filter=t->filter;stages[st].palette=t->palette;
++        }
++    }
+     if (textured && s_gpu.texs[0].valid) {
+         tex.offset = s_gpu.texs[0].offset;
+         tex.width  = s_gpu.texs[0].width;
+@@ -2212,6 +2268,7 @@ static void backend_flush(int textured)
+         tex.addr_v = s_gpu.texs[0].addr_v;
+         tex.levels = s_gpu.texs[0].pitch ? 1 : s_gpu.texs[0].levels;
+         tex.filter = s_gpu.texs[0].filter;
++        tex.palette = s_gpu.texs[0].palette;
+         batch.texture = &tex;
+     }
+     s_backend->draw(&surf, &batch);
+@@ -3321,10 +3378,27 @@ static void xf_set_viewport(void)
+     s_xf_o[2] = of[2];
+ }
+ 
++ #include "nv2a_gvs_exec.inc"
++
+ static void raster_batch_program(void)
+ {
+     uint32_t i, n = s_gpu.idx_count;
+ 
++    /* Points/lines are not drawn on GPU-VS or the CPU rasteriser yet
++     * ("points and lines: not yet"). gvs_try already GF_PRIM-skips them;
++     * returning here avoids paying the vertex program / FFP transform for
++     * batches that would only hit the empty default arm below. */
++    switch (s_gpu.prim) {
++    case NV_PRIM_POINTS:
++    case NV_PRIM_LINES:
++    case NV_PRIM_LINE_LOOP:
++    case NV_PRIM_LINE_STRIP:
++        return;
++    default:
++        break;
++    }
++
++    if (gvs_try()) return;
+     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
+         return;
+     for (i = 0; i < n; i++)
+@@ -4064,6 +4138,13 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+ static XboxFlipHold s_flip_hold;
+ static uint32_t s_vbl_count;        /* the vblank count last seen to move */
+ static uint64_t s_vbl_moved_ns;
++/* Draws accounted for by the last window publish (FLIP_STALL or no-flip
++ * scanout). RedCard's Midway/RenderWare legal splash submits full-screen
++ * frames for seconds without FLIP_INCREMENT_WRITE / FLIP_STALL; without a
++ * publish the window keeps the last POV frame (black after the fade) and
++ * the splash never appears. */
++static uint32_t s_draws_at_present;
++static uint64_t s_present_ns;
+ /* The vblank count when the walk that reaches a FLIP_STALL began, which is
+  * close to when the title submitted the segment holding its Swap. Sampled
+  * at the FLIP_STALL instead, the segment's own draw time (several ms) moved
+@@ -4071,12 +4152,26 @@ static uint64_t s_vbl_moved_ns;
+  * frame then counted as a second flip in the same vblank and was held for
+  * most of a frame. */
+ static uint32_t s_walk_vbl;
++/* Last FLIP_STALL publish. No-flip scanout stays quiet for a short window
++ * afterward so team-select / match multi-pass WAIT_FOR_IDLE cannot flash a
++ * half-built frame (the old 500 ms gate also blocked kickoff fades). */
++static uint64_t s_last_flip_publish_ns;
++
++static void scanout_poll(void);
++static void scanout_flush_armed(void);
+ 
+ void nv2a_pb_exec_walk_begin(void)
+ {
+     s_walk_vbl = xbox_VblankCount();
+ }
+ 
++/* Segment end: do not publish here. Flushing on every no-flip walk_end made
++ * team-select / controller-select flicker (same mid-pass present class as
++ * the match HUD flash). Idle poll owns no-flip present. */
++void nv2a_pb_exec_walk_end(void)
++{
++}
++
+ /* RECOMP_FLIP_PACING: unset or 0 off (flips complete at once and frame
+  * counters are bumped on every flip, as before), edge (D3D's rule: a late
+  * frame waits for the next vblank), anything else on. Opt-in: it holds the
+@@ -4117,13 +4212,15 @@ static uint32_t flip_clock(uint64_t now_ns, int *ok)
+     return c;
+ }
+ 
+-/* Once per pass of the ack loop: 1 while a flip is held. */
++/* Once per pass of the ack loop: 1 while a flip is held. Also flushes a
++ * deferred no-flip scanout once the pushbuffer has gone idle. */
+ int nv2a_pb_exec_flip_poll(void)
+ {
+     uint64_t now;
+     uint32_t c;
+     int ok;
+ 
++    scanout_poll();
+     if (!s_flip_hold.held)
+         return 0;
+     now = xbox_HostNowNs();
+@@ -4131,6 +4228,221 @@ int nv2a_pb_exec_flip_poll(void)
+     return xbox_FlipHoldPoll(&s_flip_hold, c, now, ok);
+ }
+ 
++/* Publish the surface the title just finished drawing into.
++ *
++ * FLIP_STALL is the usual path. Titles that keep drawing without flipping
++ * (RedCard's post-POV legal splash) still need the window to see each
++ * finished frame: sync any DX11 target into guest memory, then hand that
++ * buffer to the framebuffer window the same way a flip would. */
++static void publish_drawn_frame(int from_flip)
++{
++    extern void xbox_FramebufferWindowFrameStats(uint32_t);
++    extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
++    uint32_t done, pitch;
++
++    if (s_backend_present_sync)
++        s_backend_present_sync();
++
++    xbox_FramebufferWindowFrameStats(s_gpu.draws - s_draws_at_present);
++    s_draws_at_present = s_gpu.draws;
++    s_present_ns = xbox_HostNowNs();
++
++    if (!s_gpu.pitch)
++        return;
++    done = s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset;
++    pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch : s_gpu.pitch;
++    if (!done)
++        return;
++    xbox_FramebufferWindowSet(dma_resolve(done), pitch);
++    xbox_FramebufferWindowSetAA(s_gpu.aa_sy > 1.5f ? 2 : 1);
++    xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
++    /* RECOMP_FB_DUMP_FLIPS: dump every published frame (FLIP_STALL and
++     * deferred no-flip scanout), not one per report -- a consecutive
++     * sequence for headless recording / fade checks. "1" dumps from boot;
++     * any other value names a file, and frames are dumped while it exists,
++     * so a capture can start mid-game without writing gigabytes of menus. */
++    {
++        static const char *spec = (const char *)-1;
++        if (spec == (const char *)-1)
++            spec = getenv("RECOMP_FB_DUMP_FLIPS");
++        if (spec) {
++            int on = strcmp(spec, "1") == 0;
++            if (!on) {
++                FILE *f = fopen(spec, "rb");
++                if (f) { fclose(f); on = 1; }
++            }
++            s_flip_dumping = on;
++            if (on)
++                dump_surface_bmp();
++        }
++    }
++    (void)from_flip;
++}
++
++/* Deferred no-flip scanout.
++ *
++ * WAIT_FOR_IDLE mid-pass (match HUD, team-select layers) only arms; the ack
++ * loop publishes after the pushbuffer stays draw-idle, and not while flips
++ * are still current. Legal splash (no flips for seconds) still publishes.
++ * Kickoff fades after a zoom can publish once the short flip gate elapses —
++ * unlike the old 500 ms gate, which swallowed them entirely. */
++static int s_scanout_armed;
++static uint64_t s_scanout_arm_ns;
++static uint32_t s_scanout_arm_draws;
++
++/* Quiet window after FLIP_STALL before a no-flip present (default 100 ms).
++ * Override with RECOMP_SCANOUT_FLIP_GATE_MS (0..500). */
++static uint64_t scanout_flip_gate_ns(void)
++{
++    static int ms = -1;
++    if (ms < 0) {
++        const char *e = getenv("RECOMP_SCANOUT_FLIP_GATE_MS");
++        ms = e && e[0] ? atoi(e) : 100;
++        if (ms < 0) ms = 0;
++        if (ms > 500) ms = 500;
++    }
++    return (uint64_t)ms * 1000000ull;
++}
++
++static int scanout_flip_gate_blocks(uint64_t now)
++{
++    uint64_t gate = scanout_flip_gate_ns();
++    if (!gate || !s_last_flip_publish_ns)
++        return 0;
++    return now - s_last_flip_publish_ns < gate;
++}
++
++/* Arm a no-flip publish; scanout_poll flushes after idle. */
++static void scanout_without_flip(void)
++{
++    if (s_gpu.draws == s_draws_at_present)
++        return;
++    if (!s_gpu.drawn_offset && !s_gpu.color_offset)
++        return;
++    /* Full-screen (or nearly) only: shadow maps and other small RTs are
++     * not what the player should see mid-frame. */
++    if (s_gpu.drawn_w && s_gpu.drawn_h
++        && (s_gpu.drawn_w < 320 || s_gpu.drawn_h < 240))
++        return;
++    if (scanout_flip_gate_blocks(xbox_HostNowNs()))
++        return;
++    s_scanout_armed = 1;
++    s_scanout_arm_ns = xbox_HostNowNs();
++    s_scanout_arm_draws = s_gpu.draws;
++}
++
++static void scanout_flush_armed(void)
++{
++    uint64_t now;
++    if (!s_scanout_armed)
++        return;
++    /* More draws since arm: mid-pass fence; keep waiting. */
++    if (s_gpu.draws != s_scanout_arm_draws)
++        return;
++    now = xbox_HostNowNs();
++    if (scanout_flip_gate_blocks(now)) {
++        s_scanout_armed = 0;
++        return;
++    }
++    /* Throttle to ~60 Hz so a dense no-flip storm does not live in readback. */
++    if (s_present_ns && now - s_present_ns < 16000000ull)
++        return;
++    s_scanout_armed = 0;
++    {
++        static unsigned n;
++        if (n++ < 24)
++            fprintf(stderr, "[GPU] no-flip scanout (draws %u)\n",
++                    s_scanout_arm_draws);
++    }
++    publish_drawn_frame(0);
++}
++
++/* ~3 ms of no further draws → finished no-flip frame (RECOMP_SCANOUT_IDLE_MS). */
++static uint64_t scanout_idle_ns(void)
++{
++    static int ms = -1;
++    if (ms < 0) {
++        const char *e = getenv("RECOMP_SCANOUT_IDLE_MS");
++        ms = e && e[0] ? atoi(e) : 3;
++        if (ms < 1) ms = 1;
++        if (ms > 33) ms = 33;
++    }
++    return (uint64_t)ms * 1000000ull;
++}
++
++/* Swapless drawing. RedCard's boot loading screen (the Midway screen between
++ * the Point of View logo and the intro movie) redraws itself in a tight loop
++ * -- ~20,000 full-screen quads a second -- with no FLIP_STALL, swap NOP or
++ * WAIT_FOR_IDLE, for as long as the load takes; on the console the CRTC just
++ * scans the buffer out. With nothing to publish on, the window stayed black
++ * for ~4 s and the screen was never seen. When draws keep arriving but nothing
++ * has been presented for RECOMP_SCANOUT_STALL_MS (default 250; 0 disables),
++ * publish the last full-screen surface drawn, at most ~30 times a second.
++ * Titles that flip are never affected: every flip resets the clock. */
++static uint32_t s_complete_offset, s_complete_pitch, s_complete_draws;
++static void scanout_swapless(uint64_t now)
++{
++    static int ms = -1;
++    uint64_t last;
++    if (ms < 0) {
++        const char *e = getenv("RECOMP_SCANOUT_STALL_MS");
++        ms = e && e[0] ? atoi(e) : 250;
++        if (ms < 0) ms = 0;
++    }
++    if (!ms || s_gpu.draws == s_draws_at_present)
++        return;
++    if (!s_gpu.drawn_offset && !s_gpu.color_offset)
++        return;
++    if (s_gpu.drawn_w && s_gpu.drawn_h
++        && (s_gpu.drawn_w < 320 || s_gpu.drawn_h < 240))
++        return;
++    last = s_present_ns > s_last_flip_publish_ns ? s_present_ns : s_last_flip_publish_ns;
++    if (!last) {                       /* nothing presented yet: start the clock */
++        s_present_ns = now;
++        return;
++    }
++    if (now - s_last_flip_publish_ns < (uint64_t)ms * 1000000ull)
++        return;                        /* flips are current */
++    if (now - last < 33000000ull)
++        return;
++    {
++        static unsigned n;
++        if (n++ < 4)
++            fprintf(stderr, "[GPU] swapless scanout (draws %u, %llu ms since last flip)\n",
++                    s_gpu.draws, (unsigned long long)((now - s_last_flip_publish_ns) / 1000000ull));
++    }
++    s_scanout_armed = 0;
++    /* Prefer the buffer the title last finished (it switched surfaces away
++     * from it): publishing the one still being drawn showed half-drawn text. */
++    if (s_complete_offset && s_gpu.draws - s_complete_draws < 4096) {
++        uint32_t off = s_gpu.drawn_offset, pitch = s_gpu.drawn_pitch;
++        s_gpu.drawn_offset = s_complete_offset;
++        s_gpu.drawn_pitch = s_complete_pitch;
++        publish_drawn_frame(0);
++        s_gpu.drawn_offset = off;
++        s_gpu.drawn_pitch = pitch;
++        return;
++    }
++    publish_drawn_frame(0);
++}
++
++static void scanout_poll(void)
++{
++    uint64_t now;
++    scanout_swapless(xbox_HostNowNs());
++    if (!s_scanout_armed)
++        return;
++    now = xbox_HostNowNs();
++    if (s_gpu.draws != s_scanout_arm_draws) {
++        s_scanout_arm_ns = now;
++        s_scanout_arm_draws = s_gpu.draws;
++        return;
++    }
++    if (now - s_scanout_arm_ns < scanout_idle_ns())
++        return;
++    scanout_flush_armed();
++}
++
+ /* The hold's line in the periodic [GPU] report, then reset. */
+ static void flip_hold_report(void)
+ {
+@@ -4175,6 +4487,11 @@ int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param)
+ 
+ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+ {
++    static int executor_fences = -1;
++    if (executor_fences < 0)
++        executor_fences = getenv("RECOMP_FENCE_EXEC") != NULL;
++    if (executor_fences)
++        s_sem_va = xbox_Nv2aFenceWordVa();
+     /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the
+      * semaphore word; SET_SEMAPHORE_OFFSET is not added (in X-Men Legends it
+      * held 0xFF000000 at times, which put the write outside guest memory). */
+@@ -4314,6 +4631,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+     case NV097_SET_SURFACE_COLOR_OFFSET:
+         if (s_ftrace == 2)
+             fprintf(stderr, "[FTRACE] color offset -> %08X%c", param, 10);
++        /* Leaving a full-screen surface that was just drawn: that buffer is
++         * finished, which is what a swapless title wants on screen. */
++        if (param != s_gpu.color_offset && s_gpu.drawn_offset == s_gpu.color_offset
++            && s_gpu.drawn_w >= 320 && s_gpu.drawn_h >= 240) {
++            s_complete_offset = s_gpu.drawn_offset;
++            s_complete_pitch = s_gpu.drawn_pitch;
++            s_complete_draws = s_gpu.draws;
++        }
+         s_gpu.color_offset = param;
+         break;
+     case NV097_SET_COLOR_CLEAR_VALUE:
+@@ -4387,7 +4712,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+                     param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
+                     s_gpu.clear_color, 10);
+         clear_surface(param);
+-        if (param & 0x01)                         /* Z */
++        /* The software Z-buffer serves only the software rasteriser; with a
++         * back end drawing, the back end clears its own depth. */
++        if ((param & 0x01) && !backend_draws())   /* Z */
+             zbuf_clear();
+         break;
+ 
+@@ -4465,6 +4792,22 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+             xbox_FlipHoldSwap(&s_flip_hold, param);
+         return;
+ 
++    case NV097_WAIT_FOR_IDLE:
++        /* GPU idle fence. On hardware the pushbuffer stalls until engines
++         * drain; here pending DX11 work is flushed by present_sync inside
++         * scanout_without_flip when there is something new to show.
++         *
++         * RedCard's legal splash (and similar no-swap screens) ends each
++         * frame with WAIT_FOR_IDLE and never issues FLIP_STALL, so this is
++         * also the publish point that keeps the window from freezing on
++         * the previous flip. Match play flips every frame: scanout_poll
++         * waits for draw-idle so mid-pass WAIT_FOR_IDLE does not flash a
++         * HUD-less buffer, while kickoff/FK fades (idle after WAIT_FOR_IDLE)
++         * still reach the window. */
++        (void)param;
++        scanout_without_flip();
++        return;
++
+     case NV097_SET_FLIP_READ:
+         if (s_ftrace == 2)
+             fprintf(stderr, "[FTRACE] P_READ %u%c", param, 10);
+@@ -4509,8 +4852,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+         /* And this is a completed swap, which is what a title's own swap
+          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
+         xbox_Nv2aFrameCounterFlip();
+-        if (s_backend_present_sync)
+-            s_backend_present_sync();
+         /* Hand the window a copy of the frame just finished.
+          *
+          * The buffer the title has finished is the one the last batch drew
+@@ -4519,45 +4860,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+          * here, rather than letting the window read guest memory on its own
+          * clock, is what stops it showing a surface the rasteriser is still
+          * writing. */
+-        {
+-            extern void xbox_FramebufferWindowFrameStats(uint32_t);
+-            static uint32_t draws_at_flip;
+-            xbox_FramebufferWindowFrameStats(s_gpu.draws - draws_at_flip);
+-            draws_at_flip = s_gpu.draws;
+-        }
+-        if (s_gpu.pitch) {
+-            extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
+-            uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
+-                                               : s_gpu.color_offset;
+-            uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
+-                                                : s_gpu.pitch;
+-            if (done) {
+-                xbox_FramebufferWindowSet(dma_resolve(done), pitch);
+-                xbox_FramebufferWindowSetAA(s_gpu.aa_sy > 1.5f ? 2 : 1);
+-                xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
+-            }
+-        }
+-        {
+-            /* RECOMP_FB_DUMP_FLIPS: dump every presented frame, not one per
+-             * report -- a consecutive sequence, which is what a headless
+-             * recording (frames -> ffmpeg) needs. "1" dumps from boot; any
+-             * other value names a file, and frames are dumped while it
+-             * exists, so a capture can start mid-game without writing
+-             * gigabytes of menus first. */
+-            static const char *spec = (const char *)-1;
+-            if (spec == (const char *)-1)
+-                spec = getenv("RECOMP_FB_DUMP_FLIPS");
+-            if (spec) {
+-                int on = strcmp(spec, "1") == 0;
+-                if (!on) {
+-                    FILE *f = fopen(spec, "rb");
+-                    if (f) { fclose(f); on = 1; }
+-                }
+-                s_flip_dumping = on;
+-                if (on)
+-                    dump_surface_bmp();
+-            }
+-        }
++        s_scanout_armed = 0; /* FLIP_STALL owns this frame; drop deferred scanout */
++        publish_drawn_frame(1);
++        s_last_flip_publish_ns = xbox_HostNowNs();
+         s_gpu.drawn_stale = 1;
+         if (s_backend && s_backend->flip)
+             s_backend->flip();
+diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
+index 5fab4c3..366e92a 100644
+--- a/src/kernel/nv2a_pb_scan.c
++++ b/src/kernel/nv2a_pb_scan.c
+@@ -320,8 +320,11 @@ void nv2a_pb_scan(uint32_t put_phys)
+         s_get = put, s_pend_left = 0;
+         return;
+     }
+-    if (s_exec_enabled)
++    if (s_exec_enabled) {
++        extern void nv2a_pb_exec_walk_begin(void);
++        nv2a_pb_exec_walk_begin();
+         get_reg = xbox_Nv2aRegPtr(NV2A_USER_DMA_GET);
++    }
+ 
+     pb_consume(mem, put, &words);             /* the method PUT stalled inside */
+ 
+@@ -433,6 +436,10 @@ void nv2a_pb_scan(uint32_t put_phys)
+         *get_reg = s_get;
+         s_pub = s_get;
+     }
++    if (s_exec_enabled) {
++        extern void nv2a_pb_exec_walk_end(void);
++        nv2a_pb_exec_walk_end();
++    }
+     s_tot_words += words;
+     s_tot_unknown += unknown;
+     s_tot_jumps += jumps;
+@@ -549,6 +556,10 @@ void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
+         nv2a_pb_exec_walk_begin();      /* the flip hold's vblank */
+     }
+     words = pb_walk_segment(start_va, end_va, 0, &jumps, &unknown);
++    if (s_exec_enabled) {
++        extern void nv2a_pb_exec_walk_end(void);
++        nv2a_pb_exec_walk_end();
++    }
+ 
+     s_tot_words += words;
+     s_tot_unknown += unknown;
+diff --git a/src/kernel/nv2a_vsh_gen.inc b/src/kernel/nv2a_vsh_gen.inc
+new file mode 100644
+index 0000000..c9d3396
+--- /dev/null
++++ b/src/kernel/nv2a_vsh_gen.inc
+@@ -0,0 +1,256 @@
++/* nv2a_vsh_gen.inc -- PROJECT code, #included at the end of nv2a_vsh_interp.c
++ * (it needs the static decoder). Turns the active NV2A vertex program into the
++ * body of an HLSL vertex shader (see nv2a_pbx.h, Nv2aGpuVs). The semantics are
++ * those of vsh_exec above; keep them in step. */
++#include <stdarg.h>
++#include "nv2a_gpu_vs.h"
++
++typedef struct { char *p; size_t n, cap; int ovf; } GenBuf;
++
++static void gen_pf(GenBuf *b, const char *fmt, ...)
++{
++    va_list ap;
++    int r;
++
++    if (b->ovf)
++        return;
++    va_start(ap, fmt);
++    r = vsnprintf(b->p + b->n, b->cap - b->n, fmt, ap);
++    va_end(ap);
++    if (r < 0 || (size_t)r >= b->cap - b->n) {
++        b->ovf = 1;
++        return;
++    }
++    b->n += (size_t)r;
++}
++
++static const char *gen_mask(uint32_t m, char out[8])
++{
++    int k = 0;
++
++    if (m & 8) out[k++] = 'x';
++    if (m & 4) out[k++] = 'y';
++    if (m & 2) out[k++] = 'z';
++    if (m & 1) out[k++] = 'w';
++    out[k] = 0;
++    return out;
++}
++
++static void gen_src(GenBuf *b, const DecSrc *d)
++{
++    static const char sw[] = "xyzw";
++
++    gen_pf(b, "%s", d->neg ? "-" : "");
++    if (d->mux == DEC_TEMP)
++        gen_pf(b, "R[%u]", (unsigned)d->idx);
++    else if (d->mux == DEC_INPUT)
++        gen_pf(b, "V[%u]", (unsigned)d->idx);
++    else if (d->rel)
++        gen_pf(b, "KR(%u, a0)", (unsigned)d->c);
++    else
++        gen_pf(b, "K(%u)", (unsigned)(d->c < NV2A_VSH_CONSTANTS ? d->c : 0));
++    if (!(d->sw[0] == 0 && d->sw[1] == 1 && d->sw[2] == 2 && d->sw[3] == 3))
++        gen_pf(b, ".%c%c%c%c", sw[d->sw[0]], sw[d->sw[1]], sw[d->sw[2]], sw[d->sw[3]]);
++}
++
++int nv2a_vsh_export(Nv2aGpuVs *e)
++{
++    static Nv2aGpuVs cached;
++    static uint32_t revision, start, cxt;
++    static int valid;
++    uint32_t i,k,h=2166136261u;
++    if (valid && revision==s_program_revision && start==s_start_slot && cxt==s_cxt_write) {
++        memcpy(e->prog,cached.prog,cached.nslots*sizeof e->prog[0]);
++        e->nslots=cached.nslots;e->hash=cached.hash;e->input_mask=cached.input_mask;
++        e->fixed_function=0;return 1;
++    }
++    if (!s_dec_valid || s_dec_rev!=s_program_revision) dec_program();
++    e->input_mask=0;e->fixed_function=0;
++    for(i=0;i<s_dec_count;i++) {
++        const DecIns *d=&s_dec[i];
++        if(s_cxt_write && d->omask && !d->to_o) return 0;
++        memcpy(e->prog[i],s_program[s_start_slot+i],sizeof e->prog[0]);
++        for(k=0;k<3;k++) if((d->reads&(1u<<k)) && d->src[k].mux==DEC_INPUT)
++            e->input_mask|=1u<<d->src[k].idx;
++        for(k=0;k<4;k++) h=(h^e->prog[i][k])*16777619u;
++        if(d->final) {
++            e->nslots=i+1;e->hash=h;cached=*e;revision=s_program_revision;
++            start=s_start_slot;cxt=s_cxt_write;valid=1;return 1;
++        }
++    }
++    return 0;
++}
++
++int nv2a_vsh_export_ffp(Nv2aGpuVs *e, uint32_t input_mask, uint32_t variant)
++{
++    memset(e, 0, sizeof *e);
++    e->fixed_function = 1;
++    e->nslots = 0;
++    e->input_mask = input_mask;
++    /* Distinct hash per attr/lighting variant so the D3D11 specialisation
++     * cache does not reuse an unlit body for a lit batch. */
++    e->hash = 0xFF700000u ^ input_mask ^ (variant * 0x9E3779B9u);
++    return 1;
++}
++
++static void gen_decode(const uint32_t *ins, DecIns *d)
++{
++    uint32_t t=field(ins,3,20,4);int k;
++    memset(d,0,sizeof *d);
++    d->mac=(uint8_t)field(ins,1,21,4);d->ilu=(uint8_t)field(ins,1,25,3);
++    d->mac_mask=(uint8_t)field(ins,3,24,4);d->ilu_mask=(uint8_t)field(ins,3,16,4);
++    d->mac_dst=(uint8_t)t;d->ilu_dst=(uint8_t)(d->mac?1:t);
++    d->omask=(uint8_t)field(ins,3,12,4);d->oaddr=(uint8_t)field(ins,3,3,8);
++    d->to_o=(uint8_t)field(ins,3,11,1);d->from_ilu=(uint8_t)field(ins,3,2,1);
++    d->final=(uint8_t)field(ins,3,0,1);d->reads=dec_reads(d->mac,d->ilu);
++    for(k=0;k<3;k++)dec_src(ins,k,&d->src[k]);
++}
++
++/* Fixed-function GPU-VS body (after V[] fetch). Constants packed by gvs_try:
++ *   K0..K3  composite 4x4 rows (same as CPU ffp_vertex)
++ *   K4.xyz  viewport offset (c[59]); wrapper applies aa
++ *   K5.x    asuint cfg: bit0=lighting, bit1=flip_normals,
++ *           bits8..11=color attr, bits12..15=tex0 attr,
++ *           bits16..17=colmat ambient mode, bits18..19=colmat diffuse mode
++ *   K5.yzw  scene ambient rgb
++ *   K5 unused w reused: material alpha lives in K(42).x
++ *   K6..K9  modelview 4x4
++ *   light i at K(10+i*4)..K(13+i*4): amb.xyz+kind, dif.xyz+range,
++ *     Ldir_or_pos.xyz+atten0, atten1/atten2
++ *   K42.x   material alpha
++ * Outputs match program path: R[12]=screen (pre-aa), O[3]=rgba, O[9]=tex0. */
++static void gen_ffp_body(GenBuf *b)
++{
++    /* CPU ffp_vertex: clip[i] = dot(row_i, pos). HLSL mul(M,v) with M built
++     * from row vectors matches that; mul(v,M) is the transpose and was the
++     * mid-match 3D wipeout (verify: cpu screen ~469 vs gpu ~0.53). */
++    gen_pf(b,
++        "  float4x4 M = float4x4(K(0), K(1), K(2), K(3));\n"
++        "  float4 clip = mul(M, V[0]);\n"
++        "  float w = clip.w;\n"
++        /* CPU ffp_vertex drops |w|<=1e-6. Forcing w=1 exploded shadow volumes
++         * into the pitch lattice. NaN culls the triangle on D3D11. */
++        "  if (abs(w) <= 1e-6) R[12] = asfloat(0x7fc00000u).xxxx;\n"
++        "  else R[12] = float4(clip.x / w + K(4).x, clip.y / w + K(4).y, clip.z / w + K(4).z, w);\n"
++        "  uint cfg = asuint(K(5).x);\n"
++        "  uint ca = (cfg >> 8) & 15u; uint ta = (cfg >> 12) & 15u;\n"
++        "  float4 vcol = V[ca];\n"
++        "  float3 rgb = vcol.xyz; float a = vcol.w;\n"
++        "  if (cfg & 1u) {\n"
++        "    float4x4 MV = float4x4(K(6), K(7), K(8), K(9));\n"
++        "    float3 eye = mul(MV, V[0]).xyz;\n"
++        "    float3 n = mul(MV, float4(V[2].xyz, 0.0)).xyz;\n"
++        "    float nl = length(n); if (nl > 1e-8) n *= rcp(nl);\n"
++        "    if ((cfg & 2u) && dot(n, eye) > 0.0) n = -n;\n"
++        "    float3 sum = K(5).yzw;\n"
++        "    uint cma = (cfg >> 16) & 3u; uint cmd = (cfg >> 18) & 3u;\n"
++        "    [unroll] for (uint li = 0u; li < 8u; li++) {\n"
++        "      float4 L0 = K(10u + li * 4u), L1 = K(11u + li * 4u);\n"
++        "      float4 L2 = K(12u + li * 4u), L3 = K(13u + li * 4u);\n"
++        "      uint kind = (uint)L0.w; if (!kind) continue;\n"
++        "      float3 L; float att = 1.0;\n"
++        "      if (kind == 1u) L = L2.xyz;\n"
++        "      else {\n"
++        "        float3 dlt = L2.xyz - eye; float dist = length(dlt);\n"
++        "        if (L1.w > 0.0 && dist > L1.w) continue;\n"
++        "        L = dlt * rcp(max(dist, 1e-8));\n"
++        "        att = rcp(max(L2.w + L3.x * dist + L3.y * dist * dist, 1e-8));\n"
++        "      }\n"
++        "      float ndl = max(0.0, dot(n, L));\n"
++        "      float3 amb = L0.xyz, dif = L1.xyz;\n"
++        "      if (cma == 1u) amb *= vcol.xyz;\n"
++        "      if (cmd == 1u) dif *= vcol.xyz;\n"
++        "      sum += (amb + dif * ndl) * att;\n"
++        "    }\n"
++        "    rgb = saturate(sum);\n"
++        "    a = (cmd == 1u) ? vcol.w : K(42).x;\n"
++        "  }\n"
++        "  O[3] = float4(saturate(rgb), saturate(a));\n"
++        "  O[4] = float4(0.0, 0.0, 0.0, 0.0);\n" /* wrapper presets O[4].w=1; CPU FFP leaves d1 zero */
++        "  O[9] = V[ta]; O[10] = V[10]; O[11] = V[11]; O[12] = V[12];\n"
++        "  O[5] = float4(1.0, 0.0, 0.0, 1.0);\n");
++}
++
++/* Emits the statements from "float4 V[16]" to the last output write. The
++ * wrapper provides: vi (the vertex index), gbase, K(i), KR(i, a0), fetch(i, vi). */
++int nv2a_vsh_gen_hlsl(const Nv2aGpuVs *e, char *out, size_t cap)
++{
++    GenBuf gb, *b = &gb;
++    uint32_t s, i;
++    char m1[8], m2[8];
++
++    gb.p = out; gb.n = 0; gb.cap = cap; gb.ovf = 0;
++    if (!cap)
++        return 0;
++    out[0] = 0;
++    gen_pf(b, "  float4 V[16]; float4 R[13]; float4 O[13]; int a0 = 0;\n");
++    gen_pf(b, "  [unroll] for (int ii = 0; ii < 16; ii++) V[ii] = float4(0.0, 0.0, 0.0, 1.0);\n");
++    gen_pf(b, "  [unroll] for (int ij = 0; ij < 13; ij++) { R[ij] = float4(0.0, 0.0, 0.0, 0.0);"
++              " O[ij] = float4(0.0, 0.0, 0.0, 0.0); }\n");
++    gen_pf(b, "  O[3].w = 1.0; O[4].w = 1.0; O[9].w = 1.0; O[10].w = 1.0; O[11].w = 1.0; O[12].w = 1.0;\n");
++    for (i = 0; i < 16; i++)
++        if ((e->input_mask >> i) & 1)
++            gen_pf(b, "  V[%u] = fetch(%uu, vi);\n", i, i);
++    if (e->fixed_function) {
++        gen_ffp_body(b);
++        return b->ovf ? 0 : 1;
++    }
++    for (s = 0; s < e->nslots; s++) {
++        DecIns d;
++        gen_decode(e->prog[s], &d);
++        gen_pf(b, "  { // slot %u\n", s);
++        gen_pf(b, "    float4 m = float4(0.0, 0.0, 0.0, 0.0); float4 il = m;\n");
++        if (d.reads & 1) { gen_pf(b, "    float4 a = "); gen_src(b, &d.src[0]); gen_pf(b, ";\n"); }
++        if (d.reads & 2) { gen_pf(b, "    float4 bb = "); gen_src(b, &d.src[1]); gen_pf(b, ";\n"); }
++        if (d.reads & 4) { gen_pf(b, "    float4 c = "); gen_src(b, &d.src[2]); gen_pf(b, ";\n"); }
++        switch (d.mac) {
++        case 0:  break;
++        case 1:  gen_pf(b, "    m = a;\n"); break;
++        case 2:  gen_pf(b, "    m = a * bb;\n"); break;
++        case 3:  gen_pf(b, "    m = a + c;\n"); break;
++        case 4:  gen_pf(b, "    m = a * bb + c;\n"); break;
++        case 5:  gen_pf(b, "    m = m_dp3(a, bb);\n"); break;
++        case 6:  gen_pf(b, "    m = m_dph(a, bb);\n"); break;
++        case 7:  gen_pf(b, "    m = m_dp4(a, bb);\n"); break;
++        case 8:  gen_pf(b, "    m = float4(1.0, a.y * bb.y, a.z, bb.w);\n"); break;
++        case 9:  gen_pf(b, "    m = m_min(a, bb);\n"); break;
++        case 10: gen_pf(b, "    m = m_max(a, bb);\n"); break;
++        case 11: gen_pf(b, "    m = m_slt(a, bb);\n"); break;
++        case 12: gen_pf(b, "    m = m_sge(a, bb);\n"); break;
++        case 13: gen_pf(b, "    a0 = (int)floor(a.x + 0.001); m = a;\n"); break;
++        default: gen_pf(b, "    m = a;\n"); break;
++        }
++        switch (d.ilu) {
++        case 0:  break;
++        case 2:  gen_pf(b, "    il = i_rcp(c.x);\n"); break;
++        case 3:  gen_pf(b, "    il = i_rcc(c.x);\n"); break;
++        case 4:  gen_pf(b, "    il = i_rsq(c.x);\n"); break;
++        case 5:  gen_pf(b, "    il = i_exp(c.x);\n"); break;
++        case 6:  gen_pf(b, "    il = i_log(c.x);\n"); break;
++        case 7:  gen_pf(b, "    il = i_lit(c);\n"); break;
++        default: gen_pf(b, "    il = c;\n"); break;
++        }
++        if (d.mac && d.mac != 13 && d.mac_mask && d.mac_dst <= 12)
++            gen_pf(b, "    R[%u].%s = m.%s;\n", (unsigned)d.mac_dst,
++                   gen_mask(d.mac_mask, m1), gen_mask(d.mac_mask, m2));
++        if (d.ilu && d.ilu_mask) {
++            uint32_t it = d.mac ? 1u : d.mac_dst;
++            if (it <= 12)
++                gen_pf(b, "    R[%u].%s = il.%s;\n", (unsigned)it,
++                       gen_mask(d.ilu_mask, m1), gen_mask(d.ilu_mask, m2));
++        }
++        if (d.omask && d.to_o) {
++            const char *src = d.from_ilu ? "il" : "m";
++            if (d.oaddr == 0)
++                gen_pf(b, "    R[12].%s = %s.%s;\n", gen_mask(d.omask, m1), src, gen_mask(d.omask, m2));
++            else if (d.oaddr < 13)
++                gen_pf(b, "    O[%u].%s = %s.%s;\n", (unsigned)d.oaddr, gen_mask(d.omask, m1),
++                       src, gen_mask(d.omask, m2));
++        }
++        gen_pf(b, "  }\n");
++        if (d.final)
++            break;
++    }
++    return b->ovf ? 0 : 1;
++}
++
+diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
+index c7fd25d..9b919b6 100644
+--- a/src/kernel/nv2a_vsh_interp.c
++++ b/src/kernel/nv2a_vsh_interp.c
+@@ -707,3 +707,5 @@ static int vsh_run_fields(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out
+     }
+     return 0;
+ }
++
++#include "nv2a_vsh_gen.inc"
+diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
+index 7ade793..6912533 100644
+--- a/src/kernel/xbox_memory_layout.c
++++ b/src/kernel/xbox_memory_layout.c
+@@ -1296,6 +1296,10 @@ uint32_t xbox_Nv2aFenceWordVa(void)
+ 
+ static void fence_mirrors_tick(void)
+ {
++    static int executor_fences = -1;
++    if (executor_fences < 0)
++        executor_fences = getenv("RECOMP_FENCE_EXEC") != NULL;
++    if (executor_fences) return; /* semaphore releases retire in command order */
+     for (int i = 0; i < g_fence_mirror_count; i++) {
+         uint32_t dev, get_ptr;
+ 
+@@ -4386,6 +4390,43 @@ uint32_t xbox_ContiguousInUseBytes(void)
+  * most one pass of one voice. */
+ static volatile uint8_t g_phys_ram_named[CONTIG_PAGES];
+ 
++/* MmGetPhysicalAddress can give the same physical number to an image address
++ * and to its contiguous-window alias. Keep the most recently named origin at
++ * 64-byte granularity so DMA models can resolve that ambiguity without
++ * treating an entire overlapping image section as contiguous memory. */
++#define PHYS_ALIAS_GRANULARITY 64u
++#define PHYS_ALIAS_BUCKETS (XBOX_CONTIG_SIZE / PHYS_ALIAS_GRANULARITY)
++#define PHYS_ALIAS_IMAGE 1u
++#define PHYS_ALIAS_CONTIG 2u
++static volatile uint8_t g_phys_alias[PHYS_ALIAS_BUCKETS];
++
++void xbox_PhysNoteContiguousName(uint32_t va)
++{
++    if (va >= XBOX_CONTIG_BASE
++            && (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
++        g_phys_alias[(va - XBOX_CONTIG_BASE) / PHYS_ALIAS_GRANULARITY] =
++            PHYS_ALIAS_CONTIG;
++}
++
++void xbox_PhysNoteImageName(uint32_t va)
++{
++    if (va >= g_xbox_image_lo && va < g_xbox_image_hi
++            && va < XBOX_CONTIG_SIZE)
++        g_phys_alias[va / PHYS_ALIAS_GRANULARITY] = PHYS_ALIAS_IMAGE;
++}
++
++int xbox_PhysContiguousNamedAt(uint32_t pa)
++{
++    return pa < XBOX_CONTIG_SIZE
++        && g_phys_alias[pa / PHYS_ALIAS_GRANULARITY] == PHYS_ALIAS_CONTIG;
++}
++
++int xbox_PhysImageNamedAt(uint32_t pa)
++{
++    return pa < XBOX_CONTIG_SIZE
++        && g_phys_alias[pa / PHYS_ALIAS_GRANULARITY] == PHYS_ALIAS_IMAGE;
++}
++
+ /* The heap block holding `va`, live or free, or -1 when none does. Index
+  * order is address order (empty slots keep the address they had), so the
+  * search finds the last slot starting at or below `va` and steps back over
+diff --git a/src/kernel/xbox_memory_layout.h b/src/kernel/xbox_memory_layout.h
+index da4c155..4b3ab66 100644
+--- a/src/kernel/xbox_memory_layout.h
++++ b/src/kernel/xbox_memory_layout.h
+@@ -213,6 +213,10 @@ const volatile uint8_t *xbox_ContiguousPageMap(void);
+ /* MmGetPhysicalAddress named this VA; recorded if it is a heap page below
+  * 64 MB (the image and stacks are not recorded). */
+ void xbox_PhysNoteRamName(uint32_t va);
++void xbox_PhysNoteContiguousName(uint32_t va);
++void xbox_PhysNoteImageName(uint32_t va);
++int xbox_PhysContiguousNamedAt(uint32_t pa);
++int xbox_PhysImageNamedAt(uint32_t pa);
+ /* One byte per 4 KB physical page below 64 MB, nonzero while the title holds
+  * a RAM name for a heap page there (see xbox_PhysNoteRamName); cleared when
+  * no live heap block covers the page any more. Read without a lock; a device
+diff --git a/src/platform/host_time.c b/src/platform/host_time.c
+index 06c6205..6502a36 100644
+--- a/src/platform/host_time.c
++++ b/src/platform/host_time.c
+@@ -18,6 +18,50 @@
+ #else
+ #define HOST_THREAD_LOCAL _Thread_local
+ #endif
++
++/* RedCard overlay pause: while paused the clock holds still and the timer
++ * thread waits in xbox_HostTimerSleepNs until the pause ends. */
++static SRWLOCK s_hp_lock = SRWLOCK_INIT;
++static LONGLONG s_hp_total, s_hp_begin;
++static int s_hp_on;
++static HANDLE s_hp_resume;
++static INIT_ONCE s_hp_once = INIT_ONCE_STATIC_INIT;
++
++static BOOL CALLBACK hp_init(PINIT_ONCE o, PVOID p, PVOID *c)
++{
++    (void)o; (void)p; (void)c;
++    s_hp_resume = CreateEventW(NULL, TRUE, TRUE, NULL);
++    return TRUE;
++}
++
++void xbox_host_pause_begin(void)
++{
++    LARGE_INTEGER n;
++    InitOnceExecuteOnce(&s_hp_once, hp_init, NULL, NULL);
++    QueryPerformanceCounter(&n);
++    AcquireSRWLockExclusive(&s_hp_lock);
++    if (!s_hp_on) { s_hp_begin = n.QuadPart; s_hp_on = 1; ResetEvent(s_hp_resume); }
++    ReleaseSRWLockExclusive(&s_hp_lock);
++}
++
++void xbox_host_pause_end(void)
++{
++    LARGE_INTEGER n;
++    InitOnceExecuteOnce(&s_hp_once, hp_init, NULL, NULL);
++    QueryPerformanceCounter(&n);
++    AcquireSRWLockExclusive(&s_hp_lock);
++    if (s_hp_on) { s_hp_total += n.QuadPart - s_hp_begin; s_hp_on = 0; SetEvent(s_hp_resume); }
++    ReleaseSRWLockExclusive(&s_hp_lock);
++}
++
++static LONGLONG hp_counts(LONGLONG now)
++{
++    LONGLONG t;
++    AcquireSRWLockShared(&s_hp_lock);
++    t = s_hp_total + (s_hp_on ? now - s_hp_begin : 0);
++    ReleaseSRWLockShared(&s_hp_lock);
++    return t;
++}
+ #else
+ #include <time.h>
+ #include <pthread.h>
+@@ -29,6 +73,11 @@
+ #endif
+ #endif
+ 
++#ifndef _WIN32
++void xbox_host_pause_begin(void) {}
++void xbox_host_pause_end(void) {}
++#endif
++
+ uint64_t xbox_HostNowNs(void)
+ {
+ #ifdef _WIN32
+@@ -38,6 +87,7 @@ uint64_t xbox_HostNowNs(void)
+     if (!freq.QuadPart)
+         QueryPerformanceFrequency(&freq);
+     QueryPerformanceCounter(&t);
++    t.QuadPart -= hp_counts(t.QuadPart);
+     /* Split so the product never overflows: QPC runs at 10 MHz under Wine
+      * and on most hosts, and t * 1e9 would wrap after 29 minutes. */
+     return (uint64_t)(t.QuadPart / freq.QuadPart) * 1000000000ull
+@@ -113,6 +163,8 @@ void xbox_HostTimerSleepNs(uint64_t ns)
+     static HOST_THREAD_LOCAL int timer_failed;
+     HANDLE hs[2];
+ 
++    InitOnceExecuteOnce(&s_hp_once, hp_init, NULL, NULL);
++    WaitForSingleObject(s_hp_resume, INFINITE);        /* held while paused */
+     InitOnceExecuteOnce(&s_timer_wake_once, timer_wake_init, NULL, NULL);
+     if (!ns || !s_timer_wake) {
+         xbox_HostSleepNs(ns);
+diff --git a/src/platform/host_time.h b/src/platform/host_time.h
+index 7a485dc..8499a7c 100644
+--- a/src/platform/host_time.h
++++ b/src/platform/host_time.h
+@@ -44,6 +44,10 @@ void xbox_HostTimerThreadInit(void);
+ void xbox_HostTimerSleepNs(uint64_t ns);
+ void xbox_HostTimerWake(void);
+ 
++/* RedCard overlay pause: hold the host clock and park the timer thread. */
++void xbox_host_pause_begin(void);
++void xbox_host_pause_end(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/platform/recomp_exit_hook.c b/src/platform/recomp_exit_hook.c
+index fe0dc8d..c89b8cb 100644
+--- a/src/platform/recomp_exit_hook.c
++++ b/src/platform/recomp_exit_hook.c
+@@ -9,6 +9,8 @@
+ /* Set by whichever thread notes the first miss, read by the window thread:
+  * an aligned pointer store, so the reader sees the old or the new hook. */
+ static recomp_exit_hook_fn volatile s_hook;
++static recomp_exit_hook_fn volatile s_observer;
++void recomp_exit_hook_set_observer(recomp_exit_hook_fn fn) { s_observer = fn; }
+ 
+ void recomp_exit_hook_set(recomp_exit_hook_fn fn)
+ {
+@@ -20,4 +22,6 @@ void recomp_exit_hook_run(const char *why)
+     recomp_exit_hook_fn fn = s_hook;
+     if (fn != NULL)
+         fn(why);
++    fn = s_observer;
++    if (fn != NULL) fn(why);
+ }
+diff --git a/src/platform/recomp_exit_hook.h b/src/platform/recomp_exit_hook.h
+index 437c6a0..3781184 100644
+--- a/src/platform/recomp_exit_hook.h
++++ b/src/platform/recomp_exit_hook.h
+@@ -18,6 +18,8 @@ typedef void (*recomp_exit_hook_fn)(const char *why);
+ 
+ /* One hook; a second call replaces the first. Any thread. */
+ void recomp_exit_hook_set(recomp_exit_hook_fn fn);
++/* Independent observer, retained when lazy runtime reports replace the hook. */
++void recomp_exit_hook_set_observer(recomp_exit_hook_fn fn);
+ 
+ /* Calls the hook, if one is set, with why ("window"). */
+ void recomp_exit_hook_run(const char *why);
+diff --git a/src/usb/ohci.c b/src/usb/ohci.c
+index 5462e9a..0ad315a 100644
+--- a/src/usb/ohci.c
++++ b/src/usb/ohci.c
+@@ -98,6 +98,9 @@ extern uint32_t xbox_AllocThreadTib(void);
+  * reached honestly. */
+ #define OHCI_REG_MAX            0x64
+ 
++static uint32_t bus_resolve_dma(uint32_t addr);
++static uint32_t bus_resolve_dma_sticky(uint32_t addr);
++
+ /* HcCommandStatus */
+ #define CS_HCR                  0x00000001u   /* host controller reset       */
+ 
+@@ -281,7 +284,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
+          * them a second time. That is a plausible way to enumerate a device
+          * perfectly and then stop, which is what happened here. */
+         if ((v & INTR_WDH) && (*r & INTR_WDH)) {
+-            uint32_t hcca = hc->reg[HcHCCA / 4];
++            uint32_t hcca = bus_resolve_dma_sticky(hc->reg[HcHCCA / 4]);
+             if (hcca)
+                 wr32(hcca + HCCA_DONE_HEAD, 0);
+             hc->reg[HcDoneHead / 4] = 0;
+@@ -524,23 +527,77 @@ static uint32_t bus_resolve(uint32_t addr)
+     return addr;
+ }
+ 
++/* OHCI descriptors and payload buffers are physical DMA addresses. A low
++ * physical address can numerically overlap an executable XBE section; those
++ * bytes belong to the contiguous-window alias, not to the image's code. */
++static uint32_t bus_resolve_dma(uint32_t addr)
++{
++    /* Like Hitz's ownership-based DMA routing: report buffers allocated in
++     * ordinary guest RAM remain there when later texture allocations make
++     * the contiguous arena's high-water mark grow past the same number. */
++    if (xbox_PhysRamNamedAt(addr))
++        return addr;
++    if (xbox_PhysImageNamedAt(addr))
++        return addr;
++    if (xbox_PhysContiguousNamedAt(addr))
++        return OHCI_CONTIG_BASE + addr;
++    if (addr >= g_xbox_code_lo && addr < g_xbox_code_hi
++            && addr < xbox_ContiguousAllocatedBytes()
++            && addr < OHCI_CONTIG_SIZE)
++        return OHCI_CONTIG_BASE + addr;
++    return bus_resolve(addr);
++}
++
++/* The first resolution of a DMA page sticks.
++ *
++ * bus_resolve's fallback reads "below the contiguous allocator's high-water
++ * mark" as "in the window". That mark grows during play (RedCard allocates
++ * mid-match), so a report buffer XAPI set up in ordinary RAM flipped to the
++ * window a few seconds into a match: reports were written where XAPI never
++ * looked, and the game kept the last state it saw -- a player running one way
++ * for ever and no button answering. USB descriptors and report buffers are
++ * allocated once and kept, so whatever a page resolved to when the driver
++ * first used it is where it still is. */
++static uint32_t bus_resolve_dma_sticky(uint32_t addr)
++{
++    enum { NSTICK = 512 };
++    static uint32_t page[NSTICK], base[NSTICK];
++    static unsigned n, flips;
++    uint32_t pg = addr >> 12, r, i;
++
++    for (i = 0; i < n; i++)
++        if (page[i] == pg) {
++            r = bus_resolve_dma(addr);
++            if ((r >> 12) != base[i] && flips < 8) {
++                flips++;
++                fprintf(stderr, "  [OHCI] DMA page %08X now resolves to %08X; "
++                        "keeping %08X (first use)\n", pg << 12, r & ~0xFFFu, base[i] << 12);
++                fflush(stderr);
++            }
++            return (base[i] << 12) | (addr & 0xFFFu);
++        }
++    r = bus_resolve_dma(addr);
++    if (n < NSTICK) { page[n] = pg; base[n] = r >> 12; n++; }
++    return r;
++}
++
+ static uint32_t rd32(uint32_t va)
+ {
+-    va = bus_resolve(va);
++    va = bus_resolve_dma_sticky(va);
+     if (!guest_ok(va, 4))
+         return 0;
+     return *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va);
+ }
+ static void wr32(uint32_t va, uint32_t v)
+ {
+-    va = bus_resolve(va);
++    va = bus_resolve_dma_sticky(va);
+     if (!guest_ok(va, 4))
+         return;
+     *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = v;
+ }
+ static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
+ {
+-    va = bus_resolve(va);
++    va = bus_resolve_dma_sticky(va);
+     return guest_ok(va, bytes)
+          ? (uint8_t *)xbox_GetMemoryOffset() + va : NULL;
+ }
+@@ -765,7 +822,7 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
+ /* Publish the done queue where the driver reads it and say so. */
+ static void ohci_publish_done(OhciController *hc, uint32_t done_head)
+ {
+-    uint32_t hcca = hc->reg[HcHCCA / 4];
++    uint32_t hcca = bus_resolve_dma_sticky(hc->reg[HcHCCA / 4]);
+ 
+     if (hcca)
+         wr32(hcca + HCCA_DONE_HEAD, done_head);
+@@ -789,7 +846,7 @@ static int ohci_run_control_list(OhciController *hc, uint32_t *done_head)
+  * frame counter does is what makes its transfers happen at all. */
+ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
+ {
+-    uint32_t hcca = hc->reg[HcHCCA / 4];
++    uint32_t hcca = bus_resolve_dma_sticky(hc->reg[HcHCCA / 4]);
+     uint32_t slot, ed;
+     int completed;
+ 
+@@ -848,7 +905,8 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
+                     hc->reg[HcInterruptEnable / 4],
+                     hc->reg[HcInterruptStatus / 4], xbox_IrqlRaisedCount());
+             {
+-                uint32_t c = hc->reg[HcControlHeadED / 4] & ED_PTR_MASK;
++                uint32_t c = bus_resolve_dma_sticky(
++                    hc->reg[HcControlHeadED / 4] & ED_PTR_MASK);
+                 int n;
+                 fprintf(stderr, " cmd=%08X ctlhead=%08X",
+                         hc->reg[HcCommandStatus / 4], c);
+@@ -1160,7 +1218,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+          * and both are closer to right this way than a counter that never
+          * moves. */
+         {
+-            uint32_t hcca = hc->reg[HcHCCA / 4];
++            uint32_t hcca = bus_resolve_dma_sticky(hc->reg[HcHCCA / 4]);
+ 
+             hc->reg[HcFmNumber / 4] =
+                 (hc->reg[HcFmNumber / 4] + OHCI_TICK_MS) & 0xFFFFu;
+diff --git a/src/usb/usb_gamepad.c b/src/usb/usb_gamepad.c
+index bd00f3f..21a597a 100644
+--- a/src/usb/usb_gamepad.c
++++ b/src/usb/usb_gamepad.c
+@@ -211,7 +211,13 @@ int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max)
+         return -1;
+     }
+ 
+-    /* Class requests: not ours to guess at. */
++    /* Class OUT requests (SET_REPORT carrying rumble, SET_IDLE): accept.
++     * Stalling them halts the control pipe, and XAPI then treats the pad
++     * as broken. The rumble payload itself is forwarded by ohci.c. */
++    if ((setup->bmRequestType & 0x60u) == 0x20u && !is_in)
++        return 0;
++
++    /* Other class requests: not ours to guess at. */
+     return -1;
+ }
+ 
+@@ -556,7 +562,28 @@ static void pad_script_apply(int pad, uint8_t *out)
+     }
+ }
+ 
++/* RedCard overlay: while quit/settings is open every pad reports neutral. */
++volatile int redcard_input_block;
++
++static int usb_gamepad_report_real(int pad, uint8_t *out, int max);
++
+ int usb_gamepad_report(int pad, uint8_t *out, int max)
++{
++    if (redcard_input_block && max >= 20) {
++        memset(out, 0, 20);
++        out[1] = 20;
++        return 20;
++    }
++    {
++        int n = usb_gamepad_report_real(pad, out, max);
++        /* Back+Start on pad 0 opens settings: hide Start from the game. */
++        if (pad == 0 && n >= 3 && (out[2] & 0x20))
++            out[2] &= (uint8_t)~0x10;
++        return n;
++    }
++}
++
++static int usb_gamepad_report_real(int pad, uint8_t *out, int max)
+ {
+     XBOX_INPUT_STATE state;
+     const XBOX_GAMEPAD *g;
+@@ -593,13 +620,21 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
+             if (now - last > 1000) {
+                 XBOX_INPUT_STATE probe;
+                 DWORD rc = xbox_InputGetState(0, &probe);
++                DWORD fgpid = 0;
++                HWND fg = GetForegroundWindow();
+                 last = now;
+-                fprintf(stderr, "  [INPUT] kbd_env=%d window_has_RETURN=%d "
+-                        "InputGetState=%lu buttons=0x%04X\n",
++                if (fg) GetWindowThreadProcessId(fg, &fgpid);
++                /* Key table, focus, then what the pad reports: buttons,
++                 * left stick, analog A, and whether an overlay blocks it. */
++                fprintf(stderr, "  [INPUT] kbd_env=%d W=%d Up=%d Z=%d fg_self=%d rc=%lu "
++                        "buttons=0x%04X LX=%d LY=%d A=%u block=%d\n",
+                         getenv("RECOMP_KEYBOARD") ? 1 : 0,
+-                        xbox_FramebufferKeyDown(0x0D),
++                        xbox_FramebufferKeyDown('W'), xbox_FramebufferKeyDown(VK_UP),
++                        xbox_FramebufferKeyDown('Z'), fgpid == GetCurrentProcessId(),
+                         (unsigned long)rc,
+-                        rc == 0 ? probe.Gamepad.wButtons : 0);
++                        rc == 0 ? probe.Gamepad.wButtons : 0,
++                        rc == 0 ? probe.Gamepad.sThumbLX : 0, rc == 0 ? probe.Gamepad.sThumbLY : 0,
++                        rc == 0 ? probe.Gamepad.bAnalogButtons[0] : 0, (int)redcard_input_block);
+                 fflush(stderr);
+             }
+         }
+diff --git a/src/video/CMakeLists.txt b/src/video/CMakeLists.txt
+index 3fafbe7..5db0fdb 100644
+--- a/src/video/CMakeLists.txt
++++ b/src/video/CMakeLists.txt
+@@ -14,6 +14,15 @@ target_link_libraries(xbox_video PUBLIC xbox_input xbox_nv2a)
+ if(TARGET xbox_d3d8)
+     target_link_libraries(xbox_video PUBLIC xbox_d3d8)
+ endif()
++option(XBOXRECOMP_ENABLE_HOST_FMV
++    "Enable FFmpeg-backed host playback for AVI movies" OFF)
++if(WIN32 AND XBOXRECOMP_ENABLE_HOST_FMV)
++    find_package(FFMPEG REQUIRED)
++    target_compile_definitions(xbox_video PRIVATE XBOX_VIDEO_FFMPEG=1)
++    target_include_directories(xbox_video PRIVATE ${FFMPEG_INCLUDE_DIRS})
++    target_link_libraries(xbox_video PUBLIC ${FFMPEG_LIBRARIES})
++endif()
++
+ if(WIN32)
+     # gpu_present.c: the framebuffer window's D3D11 presenter.
+     target_sources(xbox_video PRIVATE gpu_present.c)
+diff --git a/src/video/fb_present.c b/src/video/fb_present.c
+index cee70c0..eadc6cd 100644
+--- a/src/video/fb_present.c
++++ b/src/video/fb_present.c
+@@ -42,6 +42,11 @@
+ #include "recomp_exit_hook.h"   /* src/platform */
+ #include <stdbool.h>
+ #include "pvideo_scanout.h"
++#ifdef REDCARD_WINDOW_HOOKS
++extern void redcard_present_tick(void);
++extern int redcard_debug_message(HWND,UINT,WPARAM,LPARAM);
++extern void redcard_window_frame(HWND,HDC,void *,int,int,int);
++#endif
+ #include "../nv2a/nv2a_mmio_hook.h"
+ 
+ extern ptrdiff_t xbox_GetMemoryOffset(void);
+@@ -222,7 +227,7 @@ static int fb_copy_presented_frame(uint32_t *dst)
+ /* Title bar, the way ps3recomp's window shows it. Written by the flip,
+  * read once a second by the window thread; a torn read shows one stale
+  * number for a second, which nobody can tell apart from a real one. */
+-static wchar_t       s_title[48] = L"Xbox Recomp";
++static wchar_t       s_title[48] = L"Redcard 20-03 Recomp";
+ static volatile LONG s_flips;
+ static volatile LONG s_frame_draws;
+ 
+@@ -237,10 +242,20 @@ void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
+ 
+ void xbox_FramebufferWindowFrameStats(uint32_t draws)
+ {
++#ifdef REDCARD_WINDOW_HOOKS
++    redcard_present_tick();
++#endif
+     InterlockedIncrement(&s_flips);
+     InterlockedExchange(&s_frame_draws, (LONG)draws);
+ }
+ 
++/* RedCard overlay setters (also used from GDI blit). */
++static int s_stretch;
++
++void xbox_FramebufferToggleFullscreen(HWND h);
++void xbox_FramebufferSetStretch(int on);
++void xbox_FramebufferSetVsync(int on);
++
+ /* Alt+Enter / F11: borderless fullscreen on the window's monitor, and back.
+  * (DXGI's own Alt+Enter, exclusive mode at the frame's 640x480, is off --
+  * gpu_present.c; both presenters letterbox to any size.) */
+@@ -269,8 +284,27 @@ static void fb_toggle_fullscreen(HWND h)
+     }
+ }
+ 
++void xbox_FramebufferToggleFullscreen(HWND h)
++{
++    if (h) fb_toggle_fullscreen(h);
++}
++
++void xbox_FramebufferSetStretch(int on)
++{
++    s_stretch = on ? 1 : 0;
++    gpu_present_set_stretch(s_stretch);
++}
++
++void xbox_FramebufferSetVsync(int on)
++{
++    gpu_present_set_vsync(on ? 1 : 0);
++}
++
+ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+ {
++#ifdef REDCARD_WINDOW_HOOKS
++    if (redcard_debug_message(h,m,w,l)) return 0;
++#endif
+     /* First press only (bit 30: the key was already down), and with Alt held
+      * (bit 29) for Enter; neither reaches the key table. */
+     if ((m == WM_SYSKEYDOWN && w == VK_RETURN && (l & (1 << 29)) && !(l & (1 << 30)))
+@@ -469,7 +503,9 @@ static void gdi_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
+         FillRect(hdc, &c, (HBRUSH)GetStockObject(BLACK_BRUSH));
+         lw = cw; lh = ch;
+     }
+-    if ((long long)cw * s_fb_height <= (long long)ch * s_fb_width) {
++    if (s_stretch) {
++        w = cw; h = ch;
++    } else if ((long long)cw * s_fb_height <= (long long)ch * s_fb_width) {
+         w = cw; h = (LONG)((long long)cw * s_fb_height / s_fb_width);
+     } else {
+         h = ch; w = (LONG)((long long)ch * s_fb_width / s_fb_height);
+@@ -485,6 +521,9 @@ static void gdi_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
+  * for vsync, so returns 1 when the loop is already paced), else GDI. */
+ static int fb_show(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
+ {
++#ifdef REDCARD_WINDOW_HOOKS
++    redcard_window_frame(hwnd,hdc,s_rgb,s_fb_width,s_fb_height,s_fb_width*4);
++#endif
+     if (gpu_present_active())
+         return gpu_present_frame(s_rgb);
+     gdi_blit(hwnd, hdc, bi);
+@@ -530,7 +569,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+                                && r.bottom - r.top <= work.bottom - work.top))
+                 break;
+         }
+-        hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
++        hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Redcard 20-03 Recomp",
+                                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                work.left + ((work.right - work.left) - (r.right - r.left)) / 2,
+                                work.top + ((work.bottom - work.top) - (r.bottom - r.top)) / 2,
+@@ -544,6 +583,9 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+     hdc = GetDC(hwnd);
+     {
+         const char *fs = getenv("RECOMP_FULLSCREEN");
++        const char *st = getenv("RECOMP_STRETCH");
++        if (st && *st && *st != '0')
++            xbox_FramebufferSetStretch(1);
+         if (fs && *fs && *fs != '0')
+             fb_toggle_fullscreen(hwnd);
+     }
+@@ -623,7 +665,9 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+                            t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0,
+                            (long)s_frame_draws);
+                 tb[127] = 0;
++#ifndef REDCARD_WINDOW_HOOKS
+                 SetWindowTextW(hwnd, tb);
++#endif
+                 t0 = now; f0 = f;
+             }
+         }
+diff --git a/src/video/gpu_present.c b/src/video/gpu_present.c
+index 4e122b1..53c3dfc 100644
+--- a/src/video/gpu_present.c
++++ b/src/video/gpu_present.c
+@@ -39,6 +39,7 @@ static HWND                      s_hwnd;
+ static uint32_t                  s_w, s_h;      /* frame size */
+ static uint32_t                  s_bw, s_bh;    /* back buffer (client) size */
+ static int                       s_vsync = 1;
++static int                       s_stretch;     /* fill window instead of 4:3 letterbox */
+ 
+ /* A triangle covering the viewport, from the vertex id; uv 0..1. */
+ static const char s_hlsl[] =
+@@ -100,9 +101,12 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
+     ID3DBlob *vsb, *psb;
+     HRESULT hr;
+     const char *v = getenv("RECOMP_PRESENT_VSYNC"), *f = getenv("RECOMP_PRESENT_FILTER");
++    const char *st = getenv("RECOMP_STRETCH");
+ 
+     if (v && v[0] == '0')
+         s_vsync = 0;
++    if (st && *st && *st != '0')
++        s_stretch = 1;
+     s_hwnd = hwnd;
+     s_w = width; s_h = height;
+     client_size(&s_bw, &s_bh);
+@@ -176,6 +180,7 @@ int gpu_present_frame(const uint32_t *pixels)
+     D3D11_VIEWPORT vp;
+     uint32_t cw, ch;
+     float sx, sy;
++    LARGE_INTEGER t0,t1,t2,t3,freq;HRESULT result;
+ 
+     if (!s_rtv || !pixels)
+         return 0;
+@@ -190,17 +195,24 @@ int gpu_present_frame(const uint32_t *pixels)
+             return 0;
+         s_bw = cw; s_bh = ch;
+     }
++    QueryPerformanceCounter(&t0);
+     ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_frame, 0, NULL,
+                                           pixels, s_w * 4, 0);
++    QueryPerformanceCounter(&t1);
+     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_rtv, NULL);
+     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_rtv, black);
+-    /* The largest rectangle of the frame's shape that fits, centred. */
+-    sx = (float)s_bw / (float)s_w;
+-    sy = (float)s_bh / (float)s_h;
+-    vp.Width = (float)s_w * (sx < sy ? sx : sy);
+-    vp.Height = (float)s_h * (sx < sy ? sx : sy);
+-    vp.TopLeftX = ((float)s_bw - vp.Width) * 0.5f;
+-    vp.TopLeftY = ((float)s_bh - vp.Height) * 0.5f;
++    /* Letterbox to 4:3 unless stretch fills the client area. */
++    if (s_stretch) {
++        vp.Width = (float)s_bw; vp.Height = (float)s_bh;
++        vp.TopLeftX = 0; vp.TopLeftY = 0;
++    } else {
++        sx = (float)s_bw / (float)s_w;
++        sy = (float)s_bh / (float)s_h;
++        vp.Width = (float)s_w * (sx < sy ? sx : sy);
++        vp.Height = (float)s_h * (sx < sy ? sx : sy);
++        vp.TopLeftX = ((float)s_bw - vp.Width) * 0.5f;
++        vp.TopLeftY = ((float)s_bh - vp.Height) * 0.5f;
++    }
+     vp.MinDepth = 0; vp.MaxDepth = 1;
+     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+@@ -212,7 +224,17 @@ int gpu_present_frame(const uint32_t *pixels)
+     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+     /* Paced only when Present waited for the vblank: with RECOMP_PRESENT_VSYNC=0
+      * the caller keeps its own 16 ms sleep instead of spinning a core. */
+-    return IDXGISwapChain_Present(s_chain, (UINT)s_vsync, 0) == S_OK && s_vsync;
++    QueryPerformanceCounter(&t2);
++    result=IDXGISwapChain_Present(s_chain,(UINT)s_vsync,0);
++    QueryPerformanceCounter(&t3);
++    {
++        static FILE *csv;static int tried;static LONGLONG last;
++        if(!tried){const char *p=getenv("RECOMP_PRESENT_CSV");tried=1;if(p){csv=fopen(p,"wb");if(csv)fputs("qpc,interval_ms,upload_ms,submit_ms,present_ms,hresult\n",csv);}}
++        if(csv){QueryPerformanceFrequency(&freq);double ms=1000.0/freq.QuadPart;
++            fprintf(csv,"%lld,%.4f,%.4f,%.4f,%.4f,%08lX\n",t3.QuadPart,last?(t3.QuadPart-last)*ms:0,(t1.QuadPart-t0.QuadPart)*ms,(t2.QuadPart-t1.QuadPart)*ms,(t3.QuadPart-t2.QuadPart)*ms,(unsigned long)result);fflush(csv);}
++        last=t3.QuadPart;
++    }
++    return result==S_OK && s_vsync;
+ }
+ 
+ void gpu_present_shutdown(void)
+@@ -232,4 +254,14 @@ int gpu_present_active(void)
+ {
+     return s_rtv != NULL;
+ }
++
++void gpu_present_set_vsync(int on)
++{
++    s_vsync = on ? 1 : 0;
++}
++
++void gpu_present_set_stretch(int on)
++{
++    s_stretch = on ? 1 : 0;
++}
+ #endif
+diff --git a/src/video/gpu_present.h b/src/video/gpu_present.h
+index 4e14e91..e4adf8b 100644
+--- a/src/video/gpu_present.h
++++ b/src/video/gpu_present.h
+@@ -12,5 +12,7 @@ int  gpu_present_init(HWND hwnd, uint32_t width, uint32_t height);
+ int  gpu_present_frame(const uint32_t *pixels);
+ int  gpu_present_active(void);
+ void gpu_present_shutdown(void);
++void gpu_present_set_vsync(int on);
++void gpu_present_set_stretch(int on);
+ #endif
+ #endif
+diff --git a/src/video/video_player.c b/src/video/video_player.c
+index 18d2633..e65ca19 100644
+--- a/src/video/video_player.c
++++ b/src/video/video_player.c
+@@ -23,6 +23,15 @@
+ #include <mferror.h>
+ #include <stdio.h>
+ #include <math.h>
++#include <errno.h>
++
++#if defined(XBOX_VIDEO_FFMPEG)
++#include <libavcodec/avcodec.h>
++#include <libavformat/avformat.h>
++#include <libavutil/error.h>
++#include <libavutil/imgutils.h>
++#include <libswscale/swscale.h>
++#endif
+ 
+ #pragma comment(lib, "mfplat.lib")
+ #pragma comment(lib, "mfreadwrite.lib")
+@@ -64,6 +73,16 @@ static struct {
+     IDirect3DTexture8   *texture;
+     uint32_t             tex_width;
+     uint32_t             tex_height;
++
++#if defined(XBOX_VIDEO_FFMPEG)
++    AVFormatContext    *ff_format;
++    AVCodecContext     *ff_codec;
++    AVPacket           *ff_packet;
++    AVFrame            *ff_frame;
++    SwsContext         *ff_scaler;
++    int                  ff_stream_index;
++    int                  ff_draining;
++#endif
+ } g_vp;
+ 
+ 
+@@ -89,6 +108,208 @@ static uint32_t next_pot(uint32_t v)
+     return v + 1;
+ }
+ 
++#if defined(XBOX_VIDEO_FFMPEG)
++static void ffmpeg_error(const char *operation, int error)
++{
++    char message[AV_ERROR_MAX_STRING_SIZE];
++    av_strerror(error, message, sizeof(message));
++    fprintf(stderr, "  [VIDEO] FFmpeg %s failed: %s (%d)\n",
++            operation, message, error);
++}
++
++static void ffmpeg_close(void)
++{
++    if (g_vp.ff_scaler) {
++        sws_freeContext(g_vp.ff_scaler);
++        g_vp.ff_scaler = NULL;
++    }
++    av_frame_free(&g_vp.ff_frame);
++    av_packet_free(&g_vp.ff_packet);
++    avcodec_free_context(&g_vp.ff_codec);
++    avformat_close_input(&g_vp.ff_format);
++    g_vp.ff_stream_index = -1;
++    g_vp.ff_draining = 0;
++}
++
++static int ffmpeg_open_avi(const char *path)
++{
++    const AVCodec *decoder = NULL;
++    AVStream *stream;
++    AVRational rate;
++    int result;
++    uint64_t frame_bytes;
++
++    result = avformat_open_input(&g_vp.ff_format, path, NULL, NULL);
++    if (result < 0) {
++        ffmpeg_error("opening AVI", result);
++        goto fail;
++    }
++    result = avformat_find_stream_info(g_vp.ff_format, NULL);
++    if (result < 0) {
++        ffmpeg_error("reading AVI streams", result);
++        goto fail;
++    }
++    result = av_find_best_stream(g_vp.ff_format, AVMEDIA_TYPE_VIDEO, -1, -1,
++                                 &decoder, 0);
++    if (result < 0 || !decoder) {
++        ffmpeg_error("finding the AVI video stream",
++                     result < 0 ? result : AVERROR_DECODER_NOT_FOUND);
++        goto fail;
++    }
++
++    g_vp.ff_stream_index = result;
++    stream = g_vp.ff_format->streams[g_vp.ff_stream_index];
++    g_vp.ff_codec = avcodec_alloc_context3(decoder);
++    if (!g_vp.ff_codec) {
++        fprintf(stderr, "  [VIDEO] FFmpeg could not allocate a decoder context\n");
++        goto fail;
++    }
++    result = avcodec_parameters_to_context(g_vp.ff_codec, stream->codecpar);
++    if (result < 0) {
++        ffmpeg_error("reading the AVI codec parameters", result);
++        goto fail;
++    }
++    result = avcodec_open2(g_vp.ff_codec, decoder, NULL);
++    if (result < 0) {
++        ffmpeg_error("opening the AVI codec", result);
++        goto fail;
++    }
++
++    g_vp.width = g_vp.ff_codec->width;
++    g_vp.height = g_vp.ff_codec->height;
++    if (g_vp.width <= 0 || g_vp.height <= 0 ||
++        g_vp.width > 8192 || g_vp.height > 8192) {
++        fprintf(stderr, "  [VIDEO] Invalid AVI dimensions %dx%d\n",
++                g_vp.width, g_vp.height);
++        goto fail;
++    }
++    frame_bytes = (uint64_t)(uint32_t)g_vp.width *
++                  (uint64_t)(uint32_t)g_vp.height * 4u;
++    if (frame_bytes > UINT32_MAX) {
++        fprintf(stderr, "  [VIDEO] AVI frame is too large (%llu bytes)\n",
++                (unsigned long long)frame_bytes);
++        goto fail;
++    }
++
++    rate = av_guess_frame_rate(g_vp.ff_format, stream, NULL);
++    if (rate.num > 0 && rate.den > 0)
++        g_vp.frame_time = (float)rate.den / (float)rate.num;
++    else
++        g_vp.frame_time = 1.0f / 30.0f;
++    if (stream->duration != AV_NOPTS_VALUE)
++        g_vp.duration = (float)(stream->duration * av_q2d(stream->time_base));
++    else if (g_vp.ff_format->duration != AV_NOPTS_VALUE)
++        g_vp.duration = (float)g_vp.ff_format->duration / AV_TIME_BASE;
++    else
++        g_vp.duration = 0.0f;
++
++    g_vp.frame_buf_size = (uint32_t)frame_bytes;
++    g_vp.stride = (uint32_t)g_vp.width * 4u;
++    g_vp.frame_buf = (uint8_t *)calloc(1, g_vp.frame_buf_size);
++    g_vp.ff_packet = av_packet_alloc();
++    g_vp.ff_frame = av_frame_alloc();
++    if (!g_vp.frame_buf || !g_vp.ff_packet || !g_vp.ff_frame) {
++        fprintf(stderr, "  [VIDEO] Could not allocate AVI decode buffers\n");
++        goto fail;
++    }
++    g_vp.ff_scaler = sws_getContext(g_vp.width, g_vp.height,
++                                    g_vp.ff_codec->pix_fmt,
++                                    g_vp.width, g_vp.height, AV_PIX_FMT_BGRA,
++                                    SWS_BILINEAR, NULL, NULL, NULL);
++    if (!g_vp.ff_scaler) {
++        fprintf(stderr, "  [VIDEO] Could not create AVI pixel converter\n");
++        goto fail;
++    }
++
++    g_vp.format = VP_FMT_RGB32;
++    g_vp.tex_width = next_pot((uint32_t)g_vp.width);
++    g_vp.tex_height = next_pot((uint32_t)g_vp.height);
++    result = d3d8_CreateTextureImpl(g_vp.tex_width, g_vp.tex_height, 1, 0,
++                                    D3DFMT_LIN_A8R8G8B8, &g_vp.texture);
++    if (FAILED(result)) {
++        fprintf(stderr, "  [VIDEO] Could not create AVI texture: 0x%08lX\n",
++                (unsigned long)result);
++        goto fail;
++    }
++
++    g_vp.elapsed = 0.0f;
++    g_vp.next_frame_at = 0.0f;
++    g_vp.finished = 0;
++    g_vp.has_frame = 0;
++    fprintf(stderr, "  [VIDEO] Opened AVI with FFmpeg: %s (%s, %dx%d, %.1f fps)\n",
++            path, decoder->name, g_vp.width, g_vp.height,
++            1.0f / g_vp.frame_time);
++    return 0;
++
++fail:
++    ffmpeg_close();
++    if (g_vp.texture) {
++        g_vp.texture->lpVtbl->Release(g_vp.texture);
++        g_vp.texture = NULL;
++    }
++    free(g_vp.frame_buf);
++    g_vp.frame_buf = NULL;
++    g_vp.frame_buf_size = 0;
++    return -1;
++}
++
++static int ffmpeg_decode_frame(void)
++{
++    int result;
++
++    for (;;) {
++        result = avcodec_receive_frame(g_vp.ff_codec, g_vp.ff_frame);
++        if (result == 0) {
++            uint8_t *destination[4] = { g_vp.frame_buf, NULL, NULL, NULL };
++            int destination_stride[4] = { (int)g_vp.stride, 0, 0, 0 };
++            result = sws_scale(g_vp.ff_scaler,
++                               (const uint8_t * const *)g_vp.ff_frame->data,
++                               g_vp.ff_frame->linesize, 0, g_vp.height,
++                               destination, destination_stride);
++            av_frame_unref(g_vp.ff_frame);
++            if (result != g_vp.height) {
++                fprintf(stderr, "  [VIDEO] FFmpeg converted %d of %d AVI rows\n",
++                        result, g_vp.height);
++                return -1;
++            }
++            g_vp.has_frame = 1;
++            return 1;
++        }
++        if (result == AVERROR_EOF)
++            return -1;
++        if (result != AVERROR(EAGAIN)) {
++            ffmpeg_error("decoding an AVI frame", result);
++            return -1;
++        }
++        if (g_vp.ff_draining)
++            return -1;
++
++        for (;;) {
++            result = av_read_frame(g_vp.ff_format, g_vp.ff_packet);
++            if (result < 0) {
++                result = avcodec_send_packet(g_vp.ff_codec, NULL);
++                if (result < 0 && result != AVERROR_EOF) {
++                    ffmpeg_error("draining the AVI decoder", result);
++                    return -1;
++                }
++                g_vp.ff_draining = 1;
++                break;
++            }
++            if (g_vp.ff_packet->stream_index == g_vp.ff_stream_index) {
++                result = avcodec_send_packet(g_vp.ff_codec, g_vp.ff_packet);
++                av_packet_unref(g_vp.ff_packet);
++                if (result < 0) {
++                    ffmpeg_error("submitting an AVI frame", result);
++                    return -1;
++                }
++                break;
++            }
++            av_packet_unref(g_vp.ff_packet);
++        }
++    }
++}
++#endif
++
+ 
+ /* ================================================================
+  * Public API
+@@ -154,6 +375,15 @@ int video_open(const char *path)
+         fclose(f);
+     }
+ 
++#if defined(XBOX_VIDEO_FFMPEG)
++    {
++        const char *extension = strrchr(path, '.');
++        if (extension && _stricmp(extension, ".avi") == 0 &&
++            ffmpeg_open_avi(path) == 0)
++            return 0;
++    }
++#endif
++
+     /* Create source reader attributes */
+     hr = MFCreateAttributes(&attrs, 1);
+     if (FAILED(hr)) goto fail;
+@@ -531,6 +761,24 @@ static void upload_frame(void)
+ 
+ int video_update(float dt)
+ {
++#if defined(XBOX_VIDEO_FFMPEG)
++    if (g_vp.ff_codec) {
++        int updated = 0;
++        if (g_vp.finished) return -1;
++        g_vp.elapsed += dt;
++        while (g_vp.elapsed >= g_vp.next_frame_at) {
++            if (ffmpeg_decode_frame() < 0) {
++                g_vp.finished = 1;
++                return updated ? 1 : -1;
++            }
++            g_vp.next_frame_at += g_vp.frame_time;
++            updated = 1;
++        }
++        if (updated)
++            upload_frame();
++        return updated;
++    }
++#endif
+     if (!g_vp.reader || g_vp.finished) return -1;
+ 
+     g_vp.elapsed += dt;
+@@ -601,6 +849,9 @@ int video_is_finished(void)
+ 
+ void video_close(void)
+ {
++#if defined(XBOX_VIDEO_FFMPEG)
++    ffmpeg_close();
++#endif
+     if (g_vp.reader) {
+         IMFSourceReader_Release(g_vp.reader);
+         g_vp.reader = NULL;
+diff --git a/tests/nv2a_ffp_backend/nv2a_ffp_backend_test.c b/tests/nv2a_ffp_backend/nv2a_ffp_backend_test.c
+index 88c69ee..5b8e385 100644
+--- a/tests/nv2a_ffp_backend/nv2a_ffp_backend_test.c
++++ b/tests/nv2a_ffp_backend/nv2a_ffp_backend_test.c
+@@ -106,6 +106,19 @@ int main(void)
+ {
+     uint32_t i;
+ 
++    /* Indexed frontend art must retain its CLUT across the backend decoder. */
++    {
++        Nv2aTexture t = {0};
++        uint32_t pixels[4];
++        t.offset=0x7000;t.width=2;t.height=2;t.color=0x0B;t.palette=0x7400;
++        s_mem[0x7000]=1;s_mem[0x7001]=2;s_mem[0x7002]=3;s_mem[0x7003]=4;
++        put32(0x7404,0xFF112233);put32(0x7408,0x80445566);
++        put32(0x740C,0x40778899);put32(0x7410,0x00AABBCC);
++        CHECK(nv2a_backend_decode_texture(&t,pixels));
++        CHECK(pixels[0]==0xFF112233 && pixels[1]==0x80445566);
++        CHECK(pixels[2]==0x40778899 && pixels[3]==0x00AABBCC);
++    }
++
+     nv2a_backend_register(&s_backend);
+ 
+     /* The flip hold is opt-in: unset, RECOMP_FLIP_PACING leaves every flip
+diff --git a/tests/nv2a_pb_walk/nv2a_pb_walk_test.c b/tests/nv2a_pb_walk/nv2a_pb_walk_test.c
+index 25e3fd5..6ab8c48 100644
+--- a/tests/nv2a_pb_walk/nv2a_pb_walk_test.c
++++ b/tests/nv2a_pb_walk/nv2a_pb_walk_test.c
+@@ -56,6 +56,7 @@ int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param)
+ void nv2a_pb_exec_report(void) {}
+ void xbox_Nv2aAckBusyBits(void) {}
+ void nv2a_pb_exec_walk_begin(void) {}       /* the flip hold's vblank sample */
++void nv2a_pb_exec_walk_end(void) {}         /* no-flip scanout flush */
+ 
+ void nv2a_pb_resync(uint32_t get_phys);
+ void nv2a_pb_scan(uint32_t put_phys);

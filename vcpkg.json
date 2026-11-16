@@ -1,0 +1,20 @@
+{
+  "name": "redcard-2003",
+  "version-string": "0.1.0",
+  "features": {
+    "host-fmv": {
+      "description": "FFmpeg-backed host playback for AVI movies",
+      "dependencies": [
+        {
+          "name": "ffmpeg",
+          "default-features": false,
+          "features": [
+            "avcodec",
+            "avformat",
+            "swscale"
+          ]
+        }
+      ]
+    }
+  }
+}

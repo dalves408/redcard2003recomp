@@ -1,0 +1,12 @@
+{
+  "xboxrecomp": {
+    "url": "https://github.com/sp00nznet/xboxrecomp.git",
+    "commit": "343b6d8901723b37ce568b2418c5df4e1fe1d223"
+  },
+  "xbox-debug-kit": {
+    "url": "https://github.com/dalves408/Xbox-Debug-Kit.git",
+    "commit": "0ce3b891d49a4bfa256bc3131019d8a4d0c0637d"
+  },
+  "capstone": "5.0.9",
+  "psutil": "7.2.2"
+}
